@@ -8,6 +8,10 @@ build = "build.rs"
 name = "kcp_rs"
 path = "src/lib.rs"
 
+[features]
+default = []
+#gen-ffi = []
+
 [dependencies]
 bytes = "1"
 crossbeam = "0.8"
