@@ -33,10 +33,10 @@ impl KcpStream {
     ) -> Self {
         let token = token.unwrap_or_else(CancellationToken::new);
         let kcp = Kcp::new(0);
-        let (msg_tx, msg_rx) = channel(kcp.snd_wnd as usize);
-        let (data_tx, data_rx) = channel(kcp.rcv_wnd as usize);
+        let (msg_tx, msg_rx) = channel(kcp.snd_wnd() as usize);
+        let (data_tx, data_rx) = channel(kcp.rcv_wnd() as usize);
 
-        let mtu = kcp.mtu;
+        let mtu = kcp.mtu();
         let task = Task {
             kcp,
             udp,
@@ -46,6 +46,7 @@ impl KcpStream {
             token: token.clone(),
             rx_buf: BytesMut::new(),
             tx_frame: None,
+            flags: 0,
         };
 
         Self {
@@ -99,14 +100,17 @@ struct Task {
     token: CancellationToken,
     rx_buf: BytesMut,
     tx_frame: Option<Bytes>,
+    flags: u32,
 }
 
 impl Task {
+    const F_FLUSH: u32 = 0x01;
+
     async fn run(mut self) {
         // TODO: enable all KCP logs.
         //self.kcp.logmask = i32::MAX;
-        self.kcp.set_nodelay(true, 10, 2, true);
-        self.kcp.stream = 1;
+        //self.kcp.set_nodelay(true, 10, 2, true);
+        self.kcp.set_stream(true);
 
         self.kcp.initialize();
         self.kcp_mtu_changed();
@@ -126,36 +130,29 @@ impl Task {
 
             select! {
                 Some(msg) = self.msg_rx.recv(), if !self.kcp.is_send_queue_full() => {
-                    let mut sent = 0;
-                    if self.process_msg(msg) > 0 {
-                        sent += 1;
-                    }
+                    self.process_msg(msg);
                     // Try to process more.
                     while !self.kcp.is_send_queue_full() {
                         match self.msg_rx.try_recv() {
-                            Ok(msg) => if self.process_msg(msg) > 0 {
-                                sent += 1;
-                            }
+                            Ok(msg) => self.process_msg(msg),
                             _ => break,
                         }
                     }
-
-                    if sent > 0 {
-                        self.kcp.update(self.kcp.current());
-                        self.kcp.flush();
-                    }
+                    // Try to flush.
+                    self.kcp_flush();
                 }
 
                 Ok(permit) = data_tx.reserve(), if self.tx_frame.is_some() => {
-                    permit.send(Data::Frame(self.tx_frame.take().unwrap()));
-                    loop {
-                        self.tx_frame = self.kcp.recv_bytes();
-                        if self.tx_frame.is_none() {
-                            break;
-                        }
+                    if let Some(data) = self.tx_frame.take() {
+                        permit.send(Data::Frame(data));
+                    }
+                    while let Some(data) = self.kcp.recv_bytes() {
                         match data_tx.try_reserve() {
-                            Ok(permit) => permit.send(Data::Frame(self.tx_frame.take().unwrap())),
-                            _ => break,
+                            Ok(permit) => permit.send(Data::Frame(data)),
+                            _ => {
+                                self.tx_frame = Some(data);
+                                break;
+                            }
                         }
                     }
                 }
@@ -166,7 +163,7 @@ impl Task {
                             self.kcp_input(size);
                             let mut recveived = 1;
                             // Try to receive more.
-                            while recveived < self.kcp.rcv_wnd {
+                            while recveived < self.kcp.rcv_wnd() {
                                 match self.udp.try_recv_from(&mut self.rx_buf) {
                                     Ok((size, addr)) if addr == self.peer_addr => {
                                         self.kcp_input(size);
@@ -180,9 +177,8 @@ impl Task {
                             if self.tx_frame.is_none() {
                                 self.tx_frame = self.kcp.recv_bytes();
                             }
-
-                            self.kcp.update(self.kcp.current());
-                            self.kcp.flush();
+                            // Try to flush.
+                            self.kcp_flush();
                          }
                          Ok(_) => (),
                          Err(e) => error!("recv from error: {}", e),
@@ -199,46 +195,59 @@ impl Task {
     }
 
     /// Return the frame size if the mssage is a data frame.
-    fn process_msg(&mut self, msg: Message) -> usize {
+    fn process_msg(&mut self, msg: Message) {
         match msg {
             Message::Frame(data) => match self.kcp.send(data.deref()) {
-                Ok(_) => return data.len(),
+                Ok(_) => {
+                    // Flush if no delay or the number of not-sent buffers > 1.
+                    if self.kcp.nodelay() != 0 || self.kcp.nsnd_que() > 1 {
+                        self.flags |= Self::F_FLUSH;
+                    }
+                }
                 _ => error!(
                     "Too big frame size: {} > {}",
                     data.len(),
-                    Kcp::max_frame_size(self.kcp.mtu)
+                    Kcp::max_frame_size(self.kcp.mtu())
                 ),
             },
-            Message::Flush => return usize::MAX,
+            Message::Flush => self.flags |= Self::F_FLUSH,
             Message::Mtu(mtu) => match self.kcp.set_mtu(mtu) {
                 Ok(_) => self.kcp_mtu_changed(),
                 Err(e) => error!("Set MTU error: {}", e),
             },
         }
-        0
     }
 
     fn kcp_mtu_changed(&mut self) {
-        if self.rx_buf.len() < self.kcp.mtu as usize {
-            self.rx_buf.resize(self.kcp.mtu as usize, 0);
+        if self.rx_buf.len() < self.kcp.mtu() as usize {
+            self.rx_buf.resize(self.kcp.mtu() as usize, 0);
+        }
+    }
+
+    fn kcp_flush(&mut self) {
+        if self.flags & Self::F_FLUSH != 0 {
+            self.flags ^= Self::F_FLUSH;
+            self.kcp.update(self.kcp.current());
+            self.kcp.flush();
         }
     }
 
     fn kcp_input(&mut self, packet_size: usize) {
-        if let Err(e) = self.kcp.input(&self.rx_buf[..packet_size]) {
-            match e.kind() {
+        match self.kcp.input(&self.rx_buf[..packet_size]) {
+            Ok(_) => self.flags |= Self::F_FLUSH,
+            Err(e) => match e.kind() {
                 io::ErrorKind::NotFound => {
                     trace!(
                         "conv not match: {} != {}",
                         Kcp::read_conv(&self.rx_buf).unwrap_or(0),
-                        self.kcp.conv
+                        self.kcp.conv()
                     );
                 }
                 io::ErrorKind::InvalidData => {
                     trace!("packet parse error");
                 }
                 _ => unreachable!(),
-            }
+            },
         }
     }
 
@@ -258,18 +267,16 @@ impl Stream for KcpStream {
     type Item = Bytes;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        loop {
-            match ready!(self.data_rx.poll_recv(cx)) {
-                Some(data) => match data {
-                    Data::Connect { peer_addr, conv } => {
-                        self.peer_addr = peer_addr;
-                        self.conv = conv;
-                    }
-                    Data::Frame(data) => return Poll::Ready(Some(data)),
-                },
-                None => return Poll::Ready(None),
+        while let Some(data) = ready!(self.data_rx.poll_recv(cx)) {
+            match data {
+                Data::Connect { peer_addr, conv } => {
+                    self.peer_addr = peer_addr;
+                    self.conv = conv;
+                }
+                Data::Frame(data) => return Poll::Ready(Some(data)),
             }
         }
+        Poll::Ready(None)
     }
 }
 
@@ -333,10 +340,11 @@ mod tests {
         let mut s1 = KcpStream::new(udp1, addr2, None);
         let mut s2 = KcpStream::new(udp2, addr1, None);
 
-        assert!(s1.send(Bytes::from_static(b"12345")).await.is_ok());
+        s1.send(Bytes::from_static(b"12345")).await.unwrap();
+        s1.flush().await.unwrap();
         println!("{:?}", s2.next().await);
 
-        let frame = Bytes::from(vec![0u8; 350880]);
+        let frame = Bytes::from(vec![0u8; 300]);
         let start = Instant::now();
         let mut received = 0;
         while start.elapsed() < Duration::from_secs(10) {
@@ -350,8 +358,8 @@ mod tests {
         }
         error!("total received {}", received);
 
-        s2.flush().await.ok();
-        assert!(s1.close().await.is_ok());
-        assert!(s2.close().await.is_ok());
+        s2.flush().await.unwrap();
+        s1.close().await.unwrap();
+        s2.close().await.unwrap();
     }
 }

@@ -3,7 +3,6 @@ use std::{
     collections::VecDeque,
     ffi::CStr,
     io,
-    ops::{Deref, DerefMut},
     os::raw::{c_char, c_int, c_long, c_void},
     ptr::null_mut,
     slice, str,
@@ -20,30 +19,37 @@ pub struct Kcp {
     output_queue: VecDeque<Bytes>,
 }
 
-impl Deref for Kcp {
-    type Target = IKCPCB;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*(self.handle as *const IKCPCB) }
-    }
-}
-
-impl DerefMut for Kcp {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *(self.handle as *mut IKCPCB) }
-    }
-}
-
 impl Drop for Kcp {
     fn drop(&mut self) {
         if self.handle != 0 {
-            unsafe { ikcp_release(self.deref_mut()) }
+            unsafe { ikcp_release(self.as_mut()) }
             self.handle = 0;
             self.output_queue.clear();
         }
     }
+}
+
+impl Kcp {
+    #[inline]
+    fn as_ref(&self) -> &IKCPCB {
+        unsafe { &*(self.handle as *const IKCPCB) }
+    }
+
+    #[inline]
+    fn as_mut(&mut self) -> &mut IKCPCB {
+        unsafe { &mut *(self.handle as *mut IKCPCB) }
+    }
+}
+
+macro_rules! export_fields {
+    ($($field:ident),+ $(,)?) => {
+        $(
+            #[inline]
+            pub fn $field(&self) -> u32 {
+                self.as_ref().$field as u32
+            }
+        )*
+    };
 }
 
 impl Kcp {
@@ -63,7 +69,7 @@ impl Kcp {
     }
 
     /// # Notice
-    /// 
+    ///
     /// After initialization, self must be ***pinned*** in memory.
     pub fn initialize(&mut self) {
         unsafe extern "C" fn _writelog(log: *const c_char, _kcp: *mut IKCPCB, _user: *mut c_void) {
@@ -88,21 +94,15 @@ impl Kcp {
             len
         }
 
-        self.user = self as *const _ as _;
-        self.output = Some(_output);
-        self.writelog = Some(_writelog);
+        self.as_mut().user = self as *const _ as _;
+        self.as_mut().output = Some(_output);
+        self.as_mut().writelog = Some(_writelog);
         self.update(self.current());
     }
 
     /// io::ErrorKind::InvalidInput - buffer is too small to contain a frame.
     pub fn peek(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match unsafe {
-            ikcp_recv(
-                self.deref_mut(),
-                buf.as_mut_ptr() as _,
-                -(buf.len() as c_int),
-            )
-        } {
+        match unsafe { ikcp_recv(self.as_mut(), buf.as_mut_ptr() as _, -(buf.len() as c_int)) } {
             size if size >= 0 => Ok(size as usize),
             -1 | -2 => Ok(0),
             -3 => Err(io::ErrorKind::InvalidInput.into()),
@@ -112,7 +112,7 @@ impl Kcp {
 
     /// io::ErrorKind::InvalidInput - buffer is too small to contain a frame.
     pub fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match unsafe { ikcp_recv(self.deref_mut(), buf.as_mut_ptr() as _, buf.len() as c_int) } {
+        match unsafe { ikcp_recv(self.as_mut(), buf.as_mut_ptr() as _, buf.len() as c_int) } {
             size if size >= 0 => Ok(size as usize),
             -1 | -2 => Ok(0),
             -3 => Err(io::ErrorKind::InvalidInput.into()),
@@ -134,12 +134,12 @@ impl Kcp {
 
     #[inline]
     pub fn peek_size(&self) -> usize {
-        unsafe { ikcp_peeksize(self.deref()).max(0) as usize }
+        unsafe { ikcp_peeksize(self.as_ref()).max(0) as usize }
     }
 
     /// io::ErrorKind::InvalidInput - frame is too large.
     pub fn send(&mut self, data: &[u8]) -> io::Result<usize> {
-        match unsafe { ikcp_send(self.deref_mut(), data.as_ptr() as _, data.len() as c_int) } {
+        match unsafe { ikcp_send(self.as_mut(), data.as_ptr() as _, data.len() as c_int) } {
             size if size >= 0 => Ok(size as usize),
             -1 | -2 => Err(io::ErrorKind::InvalidInput.into()),
             _ => unreachable!(),
@@ -150,13 +150,7 @@ impl Kcp {
     ///
     /// ErrorKind::InvalidData - Invalid packet or unrecognized command
     pub fn input(&mut self, packet: &[u8]) -> io::Result<()> {
-        match unsafe {
-            ikcp_input(
-                self.deref_mut(),
-                packet.as_ptr() as _,
-                packet.len() as c_long,
-            )
-        } {
+        match unsafe { ikcp_input(self.as_mut(), packet.as_ptr() as _, packet.len() as c_long) } {
             0 => Ok(()),
             -1 => Err(io::ErrorKind::NotFound.into()),
             -2 | -3 => Err(io::ErrorKind::InvalidData.into()),
@@ -166,21 +160,21 @@ impl Kcp {
 
     #[inline]
     pub fn flush(&mut self) {
-        unsafe { ikcp_flush(self.deref_mut()) }
+        unsafe { ikcp_flush(self.as_mut()) }
     }
 
     #[inline]
     pub fn update(&mut self, current: u32) {
-        unsafe { ikcp_update(self.deref_mut(), current) }
+        unsafe { ikcp_update(self.as_mut(), current) }
     }
 
     #[inline]
     pub fn check(&self, current: u32) -> u32 {
-        unsafe { ikcp_check(self.deref(), current) }
+        unsafe { ikcp_check(self.as_ref(), current) }
     }
 
     pub fn set_mtu(&mut self, mtu: u32) -> io::Result<()> {
-        match unsafe { ikcp_setmtu(self.deref_mut(), mtu as c_int) } {
+        match unsafe { ikcp_setmtu(self.as_mut(), mtu as c_int) } {
             0 => Ok(()),
             -1 => Err(io::ErrorKind::InvalidInput.into()),
             -2 => Err(io::ErrorKind::OutOfMemory.into()),
@@ -191,7 +185,7 @@ impl Kcp {
     pub fn set_nodelay(&mut self, nodelay: bool, interval: u32, resend: u32, nc: bool) {
         unsafe {
             ikcp_nodelay(
-                self.deref_mut(),
+                self.as_mut(),
                 if nodelay { 1 } else { 0 },
                 interval as c_int,
                 resend as c_int,
@@ -201,23 +195,29 @@ impl Kcp {
     }
 
     pub fn get_waitsnd(&self) -> u32 {
-        unsafe { ikcp_waitsnd(self.deref()) as u32 }
+        unsafe { ikcp_waitsnd(self.as_ref()) as u32 }
     }
 
     pub fn set_wndsize(&mut self, sndwnd: u32, rcvwnd: u32) {
         unsafe {
-            ikcp_wndsize(self.deref_mut(), sndwnd as c_int, rcvwnd as c_int);
+            ikcp_wndsize(self.as_mut(), sndwnd as c_int, rcvwnd as c_int);
         }
+    }
+
+    export_fields! { conv, mtu, nodelay, snd_wnd, rcv_wnd, nsnd_que }
+
+    pub fn set_stream(&mut self, stream: bool) {
+        self.as_mut().stream = if stream { 1 } else { 0 };
     }
 
     #[inline]
     pub fn is_recv_queue_full(&self) -> bool {
-        self.nrcv_que >= self.rcv_wnd
+        self.as_ref().nrcv_que >= self.rcv_wnd()
     }
 
     #[inline]
     pub fn is_send_queue_full(&self) -> bool {
-        self.get_waitsnd() >= self.snd_wnd
+        self.get_waitsnd() >= self.snd_wnd()
     }
 
     #[inline]
