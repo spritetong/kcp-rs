@@ -1,5 +1,3 @@
-use futures::{FutureExt, SinkExt, StreamExt};
-
 use crate::kcp::*;
 use crate::*;
 
@@ -8,17 +6,19 @@ pub struct KcpStream {
     conv: u32,
     mtu: u32,
     msg_sink: PollSender<Message>,
-    data_stream: ReceiverStream<Data>,
+    data_rx: Receiver<Data>,
     token: CancellationToken,
     task: Option<JoinHandle<()>>,
-    is_closed: bool,
+    is_running: bool,
 }
 
+#[derive(Debug)]
 enum Data {
     Connect { peer_addr: SocketAddr, conv: u32 },
     Frame(Bytes),
 }
 
+#[derive(Debug)]
 enum Message {
     Frame(Bytes),
     Mtu(u32),
@@ -26,7 +26,11 @@ enum Message {
 }
 
 impl KcpStream {
-    pub fn new(udp: UdpSocket, peer_addr: SocketAddr, token: Option<CancellationToken>) -> Self {
+    pub(crate) fn new(
+        udp: UdpSocket,
+        peer_addr: SocketAddr,
+        token: Option<CancellationToken>,
+    ) -> Self {
         let token = token.unwrap_or_else(CancellationToken::new);
         let kcp = Kcp::new(0);
         let (msg_tx, msg_rx) = channel(kcp.snd_wnd as usize);
@@ -49,10 +53,10 @@ impl KcpStream {
             conv: 0,
             mtu,
             msg_sink: PollSender::new(msg_tx),
-            data_stream: data_rx.into(),
+            data_rx,
             token,
             task: Some(tokio::spawn(task.run())),
-            is_closed: false,
+            is_running: true,
         }
     }
 
@@ -69,15 +73,19 @@ impl KcpStream {
             .await
             .map_err(|_| io::Error::from(io::ErrorKind::NotConnected))
     }
+
+    fn try_close(&mut self) {
+        if self.is_running {
+            self.is_running = false;
+            self.token.cancel();
+            self.data_rx.close();
+        }
+    }
 }
 
 impl Drop for KcpStream {
     fn drop(&mut self) {
-        if !self.is_closed {
-            self.is_closed = true;
-            self.token.cancel();
-            self.data_stream.close();
-        }
+        self.try_close();
         self.task.take();
     }
 }
@@ -96,9 +104,12 @@ struct Task {
 impl Task {
     async fn run(mut self) {
         // TODO: enable all KCP logs.
-        self.kcp.logmask = i32::MAX;
+        //self.kcp.logmask = i32::MAX;
+        self.kcp.set_nodelay(true, 10, 2, true);
+        self.kcp.stream = 1;
+
         self.kcp.initialize();
-        self.kcp_mut_changed();
+        self.kcp_mtu_changed();
 
         let data_tx = self.data_tx.clone();
         loop {
@@ -121,12 +132,14 @@ impl Task {
                     }
                     // Try to process more.
                     while !self.kcp.is_send_queue_full() {
-                        if let Ok(msg) = self.msg_rx.try_recv() {
-                            if self.process_msg(msg) > 0 {
+                        match self.msg_rx.try_recv() {
+                            Ok(msg) => if self.process_msg(msg) > 0 {
                                 sent += 1;
                             }
+                            _ => break,
                         }
                     }
+
                     if sent > 0 {
                         self.kcp.update(self.kcp.current());
                         self.kcp.flush();
@@ -176,7 +189,7 @@ impl Task {
                     }
                 }
 
-                _ = tokio::time::sleep(Duration::from_millis(interval as u64)) => continue,
+                _ = tokio::time::sleep(Duration::from_millis(interval as u64)) => (),
                 _ = self.token.cancelled() => break,
             }
         }
@@ -185,13 +198,7 @@ impl Task {
         self.msg_rx.close();
     }
 
-    fn kcp_mut_changed(&mut self) {
-        if self.rx_buf.len() < self.kcp.mtu as usize {
-            self.rx_buf.resize(self.kcp.mtu as usize, 0);
-        }
-    }
-
-    /// return data size
+    /// Return the frame size if the mssage is a data frame.
     fn process_msg(&mut self, msg: Message) -> usize {
         match msg {
             Message::Frame(data) => match self.kcp.send(data.deref()) {
@@ -204,21 +211,16 @@ impl Task {
             },
             Message::Flush => return usize::MAX,
             Message::Mtu(mtu) => match self.kcp.set_mtu(mtu) {
-                Ok(_) => self.kcp_mut_changed(),
+                Ok(_) => self.kcp_mtu_changed(),
                 Err(e) => error!("Set MTU error: {}", e),
             },
         }
         0
     }
 
-    async fn kcp_output(&mut self) {
-        while let Some(data) = self.kcp.pop_output() {
-            if let Err(e) = self.udp.send_to(&data, self.peer_addr).await {
-                // clear all output buffers on error
-                while self.kcp.pop_output().is_some() {}
-                warn!("send to {}: {}", &self.peer_addr, e);
-                break;
-            }
+    fn kcp_mtu_changed(&mut self) {
+        if self.rx_buf.len() < self.kcp.mtu as usize {
+            self.rx_buf.resize(self.kcp.mtu as usize, 0);
         }
     }
 
@@ -239,6 +241,17 @@ impl Task {
             }
         }
     }
+
+    async fn kcp_output(&mut self) {
+        while let Some(data) = self.kcp.pop_output() {
+            if let Err(e) = self.udp.send_to(&data, self.peer_addr).await {
+                // clear all output buffers on error
+                while self.kcp.pop_output().is_some() {}
+                warn!("send to {}: {}", &self.peer_addr, e);
+                break;
+            }
+        }
+    }
 }
 
 impl Stream for KcpStream {
@@ -246,7 +259,7 @@ impl Stream for KcpStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            match ready!(self.data_stream.poll_next_unpin(cx)) {
+            match ready!(self.data_rx.poll_recv(cx)) {
                 Some(data) => match data {
                     Data::Connect { peer_addr, conv } => {
                         self.peer_addr = peer_addr;
@@ -271,7 +284,6 @@ impl Sink<Bytes> for KcpStream {
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // Do nothing
         Poll::Ready(Ok(()))
     }
 
@@ -285,11 +297,7 @@ impl Sink<Bytes> for KcpStream {
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
         let _ = ready!(this.msg_sink.poll_close_unpin(cx));
-        if !this.is_closed {
-            this.is_closed = true;
-            this.token.cancel();
-            this.data_stream.close();
-        }
+        this.try_close();
         if let Some(task) = this.task.as_mut() {
             let _ = ready!(task.poll_unpin(cx));
             this.task.take();
@@ -314,7 +322,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream() {
-        env_logger::init();
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
 
         let addr1: SocketAddr = "127.0.0.1:4321".parse().unwrap();
         let addr2: SocketAddr = "127.0.0.1:4322".parse().unwrap();
@@ -325,11 +333,24 @@ mod tests {
         let mut s1 = KcpStream::new(udp1, addr2, None);
         let mut s2 = KcpStream::new(udp2, addr1, None);
 
-        error!("before send");
         assert!(s1.send(Bytes::from_static(b"12345")).await.is_ok());
-        error!("after send");
         println!("{:?}", s2.next().await);
 
+        let frame = Bytes::from(vec![0u8; 350880]);
+        let start = Instant::now();
+        let mut received = 0;
+        while start.elapsed() < Duration::from_secs(10) {
+            select! {
+                _ = s1.send(frame.clone()) => (),
+                Some(v) = s2.next() => {
+                    //trace!("received {}", v.len());
+                    received += v.len();
+                }
+            }
+        }
+        error!("total received {}", received);
+
+        s2.flush().await.ok();
         assert!(s1.close().await.is_ok());
         assert!(s2.close().await.is_ok());
     }

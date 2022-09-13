@@ -10,7 +10,9 @@ use std::{
     time::Instant,
 };
 
-pub use crate::ffi::*;
+#[path = "ffi.rs"]
+mod ffi;
+pub use ffi::*;
 
 pub struct Kcp {
     handle: usize,
@@ -60,7 +62,9 @@ impl Kcp {
             .wrapping_add(elapsed.subsec_millis())
     }
 
-    /// after initialization, self must be pinned in memory.
+    /// # Notice
+    /// 
+    /// After initialization, self must be ***pinned*** in memory.
     pub fn initialize(&mut self) {
         unsafe extern "C" fn _writelog(log: *const c_char, _kcp: *mut IKCPCB, _user: *mut c_void) {
             log::trace!(
@@ -128,6 +132,7 @@ impl Kcp {
         }
     }
 
+    #[inline]
     pub fn peek_size(&self) -> usize {
         unsafe { ikcp_peeksize(self.deref()).max(0) as usize }
     }
@@ -159,14 +164,17 @@ impl Kcp {
         }
     }
 
+    #[inline]
     pub fn flush(&mut self) {
         unsafe { ikcp_flush(self.deref_mut()) }
     }
 
+    #[inline]
     pub fn update(&mut self, current: u32) {
         unsafe { ikcp_update(self.deref_mut(), current) }
     }
 
+    #[inline]
     pub fn check(&self, current: u32) -> u32 {
         unsafe { ikcp_check(self.deref(), current) }
     }
