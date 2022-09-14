@@ -174,6 +174,9 @@ impl Kcp {
     }
 
     pub fn set_mtu(&mut self, mtu: u32) -> io::Result<()> {
+        if self.as_ref().mtu == mtu {
+            return Ok(());
+        }
         match unsafe { ikcp_setmtu(self.as_mut(), mtu as c_int) } {
             0 => Ok(()),
             -1 => Err(io::ErrorKind::InvalidInput.into()),
@@ -204,7 +207,7 @@ impl Kcp {
         }
     }
 
-    export_fields! { conv, mtu, nodelay, snd_wnd, rcv_wnd, nsnd_que }
+    export_fields! { conv, nsnd_que }
 
     pub fn set_stream(&mut self, stream: bool) {
         self.as_mut().stream = if stream { 1 } else { 0 };
@@ -212,12 +215,13 @@ impl Kcp {
 
     #[inline]
     pub fn is_recv_queue_full(&self) -> bool {
-        self.as_ref().nrcv_que >= self.rcv_wnd()
+        self.as_ref().nrcv_que >= self.as_ref().rcv_wnd
     }
 
     #[inline]
     pub fn is_send_queue_full(&self) -> bool {
-        self.get_waitsnd() >= self.snd_wnd()
+        //self.get_waitsnd() >= self.as_ref().snd_wnd
+        self.as_ref().nsnd_que >= self.as_ref().snd_wnd
     }
 
     #[inline]

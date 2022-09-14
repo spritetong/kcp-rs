@@ -7,9 +7,9 @@ pub struct KcpNoDelayConfig {
     /// Enable nodelay
     pub nodelay: bool,
     /// Internal update interval (ms)
-    pub interval: i32,
+    pub interval: u32,
     /// ACK number to enable fast resend
-    pub resend: i32,
+    pub resend: u32,
     /// Disable congetion control
     pub nc: bool,
 }
@@ -61,15 +61,17 @@ impl KcpNoDelayConfig {
 #[derive(Debug, Clone, Copy)]
 pub struct KcpConfig {
     /// Max Transmission Unit
-    pub mtu: usize,
+    pub mtu: u32,
     /// nodelay
     pub nodelay: KcpNoDelayConfig,
-    /// window size, (snd_wnd, rcv_wnd)
-    pub wnd_size: (u16, u16),
-    /// Session expire duration, default is 90 seconds
-    pub session_expire: Duration,
+    /// send window size
+    pub snd_wnd: u32,
+    /// recv window size
+    pub rcv_wnd: u32,
     /// Stream mode
     pub stream: bool,
+    /// Session expire duration, default is 90 seconds
+    pub session_expire: Duration,
 }
 
 impl Default for KcpConfig {
@@ -77,9 +79,10 @@ impl Default for KcpConfig {
         KcpConfig {
             mtu: 1400,
             nodelay: KcpNoDelayConfig::normal(),
-            wnd_size: (256, 256),
-            session_expire: Duration::from_secs(90),
+            snd_wnd: 32,
+            rcv_wnd: 256,
             stream: true,
+            session_expire: Duration::from_secs(90),
         }
     }
 }

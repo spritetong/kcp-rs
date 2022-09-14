@@ -16,7 +16,10 @@ use ::std::{
     ops::{Deref, DerefMut},
     pin::Pin,
     slice, str,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -28,3 +31,5 @@ use ::tokio::{
 };
 use ::tokio_stream::wrappers::ReceiverStream;
 use ::tokio_util::sync::{CancellationToken, PollSendError, PollSender};
+
+pub use config::{KcpConfig, KcpNoDelayConfig};

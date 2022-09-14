@@ -2,9 +2,9 @@ use crate::kcp::*;
 use crate::*;
 
 pub struct KcpStream {
+    config: Arc<KcpConfig>,
     peer_addr: SocketAddr,
     conv: u32,
-    mtu: u32,
     msg_sink: PollSender<Message>,
     data_rx: Receiver<Data>,
     token: CancellationToken,
@@ -21,51 +21,39 @@ enum Data {
 #[derive(Debug)]
 enum Message {
     Frame(Bytes),
-    Mtu(u32),
     Flush,
 }
 
 impl KcpStream {
     pub(crate) fn new(
+        config: &KcpConfig,
         udp: UdpSocket,
         peer_addr: SocketAddr,
         token: Option<CancellationToken>,
     ) -> Self {
+        let config = Arc::new(config.clone());
         let token = token.unwrap_or_else(CancellationToken::new);
-        let kcp = Kcp::new(0);
-        let (msg_tx, msg_rx) = channel(kcp.snd_wnd() as usize);
-        let (data_tx, data_rx) = channel(kcp.rcv_wnd() as usize);
+        let (msg_tx, msg_rx) = channel(config.snd_wnd as usize);
+        let (data_tx, data_rx) = channel(config.rcv_wnd as usize);
 
-        let mtu = kcp.mtu();
-        let task = Task {
-            kcp,
+        let task = Task::new(
+            config.clone(),
             udp,
             peer_addr,
             msg_rx,
             data_tx,
-            token: token.clone(),
-            rx_buf: BytesMut::new(),
-            tx_frame: None,
-            flags: 0,
-        };
-
+            token.clone(),
+        );
         Self {
+            config,
             peer_addr,
             conv: 0,
-            mtu,
             msg_sink: PollSender::new(msg_tx),
             data_rx,
             token,
             task: Some(tokio::spawn(task.run())),
             is_running: true,
         }
-    }
-
-    pub async fn set_mtu(&mut self, mtu: u32) -> io::Result<()> {
-        self.msg_sink
-            .send(Message::Mtu(mtu))
-            .await
-            .map_err(|_| io::Error::from(io::ErrorKind::NotConnected))
     }
 
     pub async fn flush(&mut self) -> io::Result<()> {
@@ -93,6 +81,7 @@ impl Drop for KcpStream {
 
 struct Task {
     kcp: Kcp,
+    config: Arc<KcpConfig>,
     udp: UdpSocket,
     peer_addr: SocketAddr,
     msg_rx: Receiver<Message>,
@@ -100,20 +89,41 @@ struct Task {
     token: CancellationToken,
     rx_buf: BytesMut,
     tx_frame: Option<Bytes>,
-    flags: u32,
+    states: u32,
 }
 
 impl Task {
-    const F_FLUSH: u32 = 0x01;
+    const FLUSH: u32 = 0x01;
+
+    fn new(
+        config: Arc<KcpConfig>,
+        udp: UdpSocket,
+        peer_addr: SocketAddr,
+        msg_rx: Receiver<Message>,
+        data_tx: Sender<Data>,
+        token: CancellationToken,
+    ) -> Self {
+        let kcp = Kcp::new(0);
+        Self {
+            kcp,
+            config,
+            udp,
+            peer_addr,
+            msg_rx,
+            data_tx,
+            token,
+            rx_buf: BytesMut::new(),
+            tx_frame: None,
+            states: 0,
+        }
+    }
 
     async fn run(mut self) {
         // TODO: enable all KCP logs.
         //self.kcp.logmask = i32::MAX;
-        //self.kcp.set_nodelay(true, 10, 2, true);
-        self.kcp.set_stream(true);
 
         self.kcp.initialize();
-        self.kcp_mtu_changed();
+        self.kcp_apply_config();
 
         let data_tx = self.data_tx.clone();
         loop {
@@ -150,6 +160,7 @@ impl Task {
                         match data_tx.try_reserve() {
                             Ok(permit) => permit.send(Data::Frame(data)),
                             _ => {
+                                // Save the data frame.
                                 self.tx_frame = Some(data);
                                 break;
                             }
@@ -159,17 +170,16 @@ impl Task {
 
                 v = self.udp.recv_from(&mut self.rx_buf) => {
                     match v {
-                         Ok((size, addr)) if addr == self.peer_addr => {
-                            self.kcp_input(size);
-                            let mut recveived = 1;
+                         Ok((size, addr)) => {
+                            if addr == self.peer_addr {
+                                self.kcp_input(size);
+                            }
                             // Try to receive more.
-                            while recveived < self.kcp.rcv_wnd() {
+                            for _ in 1..self.config.rcv_wnd {
                                 match self.udp.try_recv_from(&mut self.rx_buf) {
-                                    Ok((size, addr)) if addr == self.peer_addr => {
+                                    Ok((size, addr)) => if addr == self.peer_addr {
                                         self.kcp_input(size);
-                                        recveived += 1;
                                     }
-                                    Ok(_) => (),
                                     Err(_) => break,
                                 }
                             }
@@ -180,7 +190,6 @@ impl Task {
                             // Try to flush.
                             self.kcp_flush();
                          }
-                         Ok(_) => (),
                          Err(e) => error!("recv from error: {}", e),
                     }
                 }
@@ -200,33 +209,42 @@ impl Task {
             Message::Frame(data) => match self.kcp.send(data.deref()) {
                 Ok(_) => {
                     // Flush if no delay or the number of not-sent buffers > 1.
-                    if self.kcp.nodelay() != 0 || self.kcp.nsnd_que() > 1 {
-                        self.flags |= Self::F_FLUSH;
+                    if self.config.nodelay.nodelay || self.kcp.nsnd_que() > 1 {
+                        self.states |= Self::FLUSH;
                     }
                 }
                 _ => error!(
                     "Too big frame size: {} > {}",
                     data.len(),
-                    Kcp::max_frame_size(self.kcp.mtu())
+                    Kcp::max_frame_size(self.config.mtu)
                 ),
             },
-            Message::Flush => self.flags |= Self::F_FLUSH,
-            Message::Mtu(mtu) => match self.kcp.set_mtu(mtu) {
-                Ok(_) => self.kcp_mtu_changed(),
-                Err(e) => error!("Set MTU error: {}", e),
-            },
+            Message::Flush => self.states |= Self::FLUSH,
         }
     }
 
-    fn kcp_mtu_changed(&mut self) {
-        if self.rx_buf.len() < self.kcp.mtu() as usize {
-            self.rx_buf.resize(self.kcp.mtu() as usize, 0);
+    fn kcp_apply_config(&mut self) {
+        self.kcp.set_stream(self.config.stream);
+        self.kcp.set_mtu(self.config.mtu).unwrap();
+        self.kcp
+            .set_wndsize(self.config.snd_wnd, self.config.rcv_wnd);
+        self.kcp.set_nodelay(
+            self.config.nodelay.nodelay,
+            self.config.nodelay.interval,
+            self.config.nodelay.resend,
+            self.config.nodelay.nc,
+        );
+
+        // Resize buffer.
+        let size = self.config.mtu as usize * 3;
+        if self.rx_buf.len() < size {
+            self.rx_buf.resize(size, 0);
         }
     }
 
     fn kcp_flush(&mut self) {
-        if self.flags & Self::F_FLUSH != 0 {
-            self.flags ^= Self::F_FLUSH;
+        if self.states & Self::FLUSH != 0 {
+            self.states ^= Self::FLUSH;
             self.kcp.update(self.kcp.current());
             self.kcp.flush();
         }
@@ -234,11 +252,11 @@ impl Task {
 
     fn kcp_input(&mut self, packet_size: usize) {
         match self.kcp.input(&self.rx_buf[..packet_size]) {
-            Ok(_) => self.flags |= Self::F_FLUSH,
+            Ok(_) => self.states |= Self::FLUSH,
             Err(e) => match e.kind() {
                 io::ErrorKind::NotFound => {
                     trace!(
-                        "conv not match: {} != {}",
+                        "conv does not match: {} != {}",
                         Kcp::read_conv(&self.rx_buf).unwrap_or(0),
                         self.kcp.conv()
                     );
@@ -337,14 +355,18 @@ mod tests {
         let udp1 = UdpSocket::bind(addr1).await.unwrap();
         let udp2 = UdpSocket::bind(addr2).await.unwrap();
 
-        let mut s1 = KcpStream::new(udp1, addr2, None);
-        let mut s2 = KcpStream::new(udp2, addr1, None);
+        let config = KcpConfig {
+            nodelay: KcpNoDelayConfig::normal(),
+            ..Default::default()
+        };
+        let mut s1 = KcpStream::new(&config, udp1, addr2, None);
+        let mut s2 = KcpStream::new(&config, udp2, addr1, None);
 
         s1.send(Bytes::from_static(b"12345")).await.unwrap();
         s1.flush().await.unwrap();
         println!("{:?}", s2.next().await);
 
-        let frame = Bytes::from(vec![0u8; 300]);
+        let frame = Bytes::from(vec![0u8; 3000]);
         let start = Instant::now();
         let mut received = 0;
         while start.elapsed() < Duration::from_secs(10) {
