@@ -1,9 +1,13 @@
 use crate::kcp::*;
 use crate::*;
+use futures::stream::TryStreamExt;
+use std::fmt::Display;
+use bytestring::ByteString;
+use futures::future::poll_fn;
 
 pub struct KcpStream {
     config: Arc<KcpConfig>,
-    peer_addr: SocketAddr,
+    peer_addr: ByteString,
     conv: u32,
     msg_sink: PollSender<Message>,
     data_rx: Receiver<Data>,
@@ -14,7 +18,7 @@ pub struct KcpStream {
 
 #[derive(Debug)]
 enum Data {
-    Connect { peer_addr: SocketAddr, conv: u32 },
+    Connect { conv: u32 },
     Frame(Bytes),
 }
 
@@ -25,24 +29,23 @@ enum Message {
 }
 
 impl KcpStream {
-    pub(crate) fn new(
+    pub(crate) fn new<S, R>(
         config: Arc<KcpConfig>,
-        udp: UdpSocket,
-        peer_addr: SocketAddr,
+        peer_addr: String,
+        sink: S,
+        stream: R,
         token: Option<CancellationToken>,
-    ) -> Self {
+    ) -> Self
+    where
+        S: Sink<Bytes> + Send + Unpin + 'static,
+        S::Error: Display,
+        R: Stream<Item = BytesMut> + Send + Unpin + 'static,
+    {
         let token = token.unwrap_or_else(CancellationToken::new);
         let (msg_tx, msg_rx) = channel(config.snd_wnd as usize);
         let (data_tx, data_rx) = channel(config.rcv_wnd as usize);
 
-        let task = Task::new(
-            config.clone(),
-            udp,
-            peer_addr,
-            msg_rx,
-            data_tx,
-            token.clone(),
-        );
+        let task = Task::new(config.clone(), sink, stream, msg_rx, data_tx, token.clone());
         Self {
             config,
             peer_addr,
@@ -78,11 +81,11 @@ impl Drop for KcpStream {
     }
 }
 
-struct Task {
+struct Task<S, R> {
     kcp: Kcp,
     config: Arc<KcpConfig>,
-    udp: UdpSocket,
-    peer_addr: SocketAddr,
+    sink: S,
+    stream: R,
     msg_rx: Receiver<Message>,
     data_tx: Sender<Data>,
     token: CancellationToken,
@@ -91,13 +94,18 @@ struct Task {
     states: u32,
 }
 
-impl Task {
+impl<S, R> Task<S, R>
+where
+    S: Sink<Bytes> + Send + Unpin,
+    S::Error: Display,
+    R: Stream<Item = BytesMut> + Send + Unpin,
+{
     const FLUSH: u32 = 0x01;
 
     fn new(
         config: Arc<KcpConfig>,
-        udp: UdpSocket,
-        peer_addr: SocketAddr,
+        sink: S,
+        stream: R,
         msg_rx: Receiver<Message>,
         data_tx: Sender<Data>,
         token: CancellationToken,
@@ -106,8 +114,8 @@ impl Task {
         Self {
             kcp,
             config,
-            udp,
-            peer_addr,
+            sink,
+            stream,
             msg_rx,
             data_tx,
             token,
@@ -167,21 +175,20 @@ impl Task {
                     }
                 }
 
-                v = self.udp.recv_from(&mut self.rx_buf) => {
+                v = self.stream.next() => {
                     match v {
-                         Ok((size, addr)) => {
-                            if addr == self.peer_addr {
-                                self.kcp_input(size);
-                            }
+                         Some(data) => {
+                            self.kcp_input(data);
                             // Try to receive more.
-                            for _ in 1..self.config.rcv_wnd {
-                                match self.udp.try_recv_from(&mut self.rx_buf) {
-                                    Ok((size, addr)) => if addr == self.peer_addr {
-                                        self.kcp_input(size);
+                            poll_fn(|cx| {
+                                for _ in 1..self.config.rcv_wnd {
+                                    match self.stream.poll_next_unpin(cx) {
+                                        Poll::Ready(Some(data)) => self.kcp_input(data),
+                                        _ => break,
                                     }
-                                    Err(_) => break,
                                 }
-                            }
+                                Poll::Ready(())
+                            }).await;
                             // Try to fetch a frame.
                             if self.tx_frame.is_none() {
                                 self.tx_frame = self.kcp.recv_bytes();
@@ -189,7 +196,7 @@ impl Task {
                             // Try to flush.
                             self.kcp_flush();
                          }
-                         Err(e) => error!("recv from error: {}", e),
+                         _ => break,
                     }
                 }
 
@@ -249,8 +256,8 @@ impl Task {
         }
     }
 
-    fn kcp_input(&mut self, packet_size: usize) {
-        match self.kcp.input(&self.rx_buf[..packet_size]) {
+    fn kcp_input(&mut self, data: BytesMut) {
+        match self.kcp.input(&data) {
             Ok(_) => self.states |= Self::FLUSH,
             Err(e) => match e.kind() {
                 io::ErrorKind::NotFound => {
@@ -270,13 +277,14 @@ impl Task {
 
     async fn kcp_output(&mut self) {
         while let Some(data) = self.kcp.pop_output() {
-            if let Err(e) = self.udp.send_to(&data, self.peer_addr).await {
+            if let Err(e) = self.sink.feed(data).await {
                 // clear all output buffers on error
                 while self.kcp.pop_output().is_some() {}
-                warn!("send to {}: {}", &self.peer_addr, e);
+                warn!("send to sink: {}", e);
                 break;
             }
         }
+        self.sink.flush().await.ok();
     }
 }
 
@@ -286,8 +294,7 @@ impl Stream for KcpStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         while let Some(data) = ready!(self.data_rx.poll_recv(cx)) {
             match data {
-                Data::Connect { peer_addr, conv } => {
-                    self.peer_addr = peer_addr;
+                Data::Connect { conv } => {
                     self.conv = conv;
                 }
                 Data::Frame(data) => return Poll::Ready(Some(data)),
@@ -351,21 +358,31 @@ mod tests {
         let addr1: SocketAddr = "127.0.0.1:4321".parse().unwrap();
         let addr2: SocketAddr = "127.0.0.1:4322".parse().unwrap();
 
-        let udp1 = UdpSocket::bind(addr1).await.unwrap();
-        let udp2 = UdpSocket::bind(addr2).await.unwrap();
+        let udp1 = Arc::new(UdpSocket::bind(addr1).await.unwrap());
+        let stream1 =
+            tokio_util::udp::UdpFramed::new(udp1.clone(), tokio_util::codec::BytesCodec::new())
+                .filter_map(|x| futures::future::ready(x.ok().map(|(x, _)| x)));
+        let sink1 = tokio_util::udp::UdpFramed::new(udp1, tokio_util::codec::BytesCodec::new())
+            .with(move |x: Bytes| futures::future::ready(io::Result::Ok((x, addr2))));
+
+        let udp2 = Arc::new(UdpSocket::bind(addr2).await.unwrap());
+        let stream2 =
+            tokio_util::udp::UdpFramed::new(udp2.clone(), tokio_util::codec::BytesCodec::new())
+                .filter_map(|x| futures::future::ready(x.ok().map(|(x, _)| x)));
+        let sink2 = tokio_util::udp::UdpFramed::new(udp2, tokio_util::codec::BytesCodec::new())
+            .with(move |x: Bytes| futures::future::ready(io::Result::Ok((x, addr1))));
 
         let config = Arc::new(KcpConfig {
             nodelay: KcpNoDelayConfig::normal(),
             ..Default::default()
         });
-        let mut s1 = KcpStream::new(config.clone(), udp1, addr2, None);
-        let mut s2 = KcpStream::new(config, udp2, addr1, None);
+        let mut s1 = KcpStream::new(config.clone(), addr2.to_string().into(), sink1, stream1, None);
+        let mut s2 = KcpStream::new(config, addr1.into(), sink2, stream2, None);
 
         s1.send(Bytes::from_static(b"12345")).await.unwrap();
-        s1.flush().await.unwrap();
         println!("{:?}", s2.next().await);
 
-        let frame = Bytes::from(vec![0u8; 3000]);
+        let frame = Bytes::from(vec![0u8; 300000]);
         let start = Instant::now();
         let mut received = 0;
         while start.elapsed() < Duration::from_secs(10) {
