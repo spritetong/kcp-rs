@@ -26,12 +26,11 @@ enum Message {
 
 impl KcpStream {
     pub(crate) fn new(
-        config: &KcpConfig,
+        config: Arc<KcpConfig>,
         udp: UdpSocket,
         peer_addr: SocketAddr,
         token: Option<CancellationToken>,
     ) -> Self {
-        let config = Arc::new(config.clone());
         let token = token.unwrap_or_else(CancellationToken::new);
         let (msg_tx, msg_rx) = channel(config.snd_wnd as usize);
         let (data_tx, data_rx) = channel(config.rcv_wnd as usize);
@@ -355,12 +354,12 @@ mod tests {
         let udp1 = UdpSocket::bind(addr1).await.unwrap();
         let udp2 = UdpSocket::bind(addr2).await.unwrap();
 
-        let config = KcpConfig {
+        let config = Arc::new(KcpConfig {
             nodelay: KcpNoDelayConfig::normal(),
             ..Default::default()
-        };
-        let mut s1 = KcpStream::new(&config, udp1, addr2, None);
-        let mut s2 = KcpStream::new(&config, udp2, addr1, None);
+        });
+        let mut s1 = KcpStream::new(config.clone(), udp1, addr2, None);
+        let mut s2 = KcpStream::new(config, udp2, addr1, None);
 
         s1.send(Bytes::from_static(b"12345")).await.unwrap();
         s1.flush().await.unwrap();
