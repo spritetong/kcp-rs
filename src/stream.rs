@@ -1,13 +1,13 @@
 use crate::kcp::*;
 use crate::*;
-use futures::stream::TryStreamExt;
-use std::fmt::Display;
 use bytestring::ByteString;
 use futures::future::poll_fn;
+use futures::stream::TryStreamExt;
+use std::fmt::Display;
 
 pub struct KcpStream {
     config: Arc<KcpConfig>,
-    peer_addr: ByteString,
+    id: ByteString,
     conv: u32,
     msg_sink: PollSender<Message>,
     data_rx: Receiver<Data>,
@@ -31,7 +31,7 @@ enum Message {
 impl KcpStream {
     pub(crate) fn new<S, R>(
         config: Arc<KcpConfig>,
-        peer_addr: String,
+        id: ByteString,
         sink: S,
         stream: R,
         token: Option<CancellationToken>,
@@ -48,7 +48,7 @@ impl KcpStream {
         let task = Task::new(config.clone(), sink, stream, msg_rx, data_tx, token.clone());
         Self {
             config,
-            peer_addr,
+            id,
             conv: 0,
             msg_sink: PollSender::new(msg_tx),
             data_rx,
@@ -376,8 +376,14 @@ mod tests {
             nodelay: KcpNoDelayConfig::normal(),
             ..Default::default()
         });
-        let mut s1 = KcpStream::new(config.clone(), addr2.to_string().into(), sink1, stream1, None);
-        let mut s2 = KcpStream::new(config, addr1.into(), sink2, stream2, None);
+        let mut s1 = KcpStream::new(
+            config.clone(),
+            addr2.to_string().into(),
+            sink1,
+            stream1,
+            None,
+        );
+        let mut s2 = KcpStream::new(config, addr1.to_string().into(), sink2, stream2, None);
 
         s1.send(Bytes::from_static(b"12345")).await.unwrap();
         println!("{:?}", s2.next().await);
