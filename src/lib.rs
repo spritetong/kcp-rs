@@ -7,10 +7,15 @@ pub mod listener;
 pub mod stream;
 
 use ::bytes::{Buf, BufMut, Bytes, BytesMut};
+use ::bytestring::ByteString;
 use ::crossbeam::atomic::AtomicCell;
-use ::futures::{ready, FutureExt, Sink, SinkExt, Stream, StreamExt};
+use ::futures::{
+    future::{poll_fn, ready},
+    ready, FutureExt, Sink, SinkExt, Stream, StreamExt,
+};
 use ::log::{debug, error, trace, warn};
 use ::std::{
+    fmt::Display,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     ops::{Deref, DerefMut},
@@ -31,5 +36,6 @@ use ::tokio::{
 };
 use ::tokio_stream::wrappers::ReceiverStream;
 use ::tokio_util::sync::{CancellationToken, PollSendError, PollSender};
+use ::zerocopy::{AsBytes, FromBytes};
 
 pub use config::{KcpConfig, KcpNoDelayConfig};

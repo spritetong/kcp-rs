@@ -61,7 +61,7 @@ impl Kcp {
         }
     }
 
-    pub fn current(&self) -> u32 {
+    pub fn get_system_time(&self) -> u32 {
         let elapsed = self.time_base.elapsed();
         (elapsed.as_secs() as u32)
             .wrapping_mul(1000)
@@ -97,7 +97,7 @@ impl Kcp {
         self.as_mut().user = self as *const _ as _;
         self.as_mut().output = Some(_output);
         self.as_mut().writelog = Some(_writelog);
-        self.update(self.current());
+        self.update(self.get_system_time());
     }
 
     /// io::ErrorKind::InvalidInput - buffer is too small to contain a frame.
@@ -207,10 +207,25 @@ impl Kcp {
         }
     }
 
-    export_fields! { conv, nsnd_que }
+    ////////////////////////////////////////////////////////////////////////////
+
+    export_fields! { conv, current, nsnd_que }
+
+    pub fn duration_since(&self, since: u32) -> u32 {
+        (self.current().wrapping_sub(since) as i32).max(0) as u32
+    }
+
+    pub fn set_conv(&mut self, conv: u32) {
+        self.as_mut().conv = conv;
+    }
 
     pub fn set_stream(&mut self, stream: bool) {
         self.as_mut().stream = if stream { 1 } else { 0 };
+    }
+
+    #[inline]
+    pub fn is_dead_link(&self) -> bool {
+        self.as_ref().state == u32::MAX
     }
 
     #[inline]
@@ -235,12 +250,30 @@ impl Kcp {
     }
 
     /// Read conv from a packet buffer.
-    pub fn read_conv(mut buf: &[u8]) -> Option<u32> {
+    #[inline]
+    pub fn read_conv(buf: &[u8]) -> Option<u32> {
         if buf.len() >= IKCP_OVERHEAD as usize {
-            Some(buf.get_u32_le())
+            Some(unsafe {
+                (*buf.get_unchecked(0) as u32)
+                    | (*buf.get_unchecked(1) as u32).wrapping_shl(8)
+                    | (*buf.get_unchecked(2) as u32).wrapping_shl(16)
+                    | (*buf.get_unchecked(3) as u32).wrapping_shl(24)
+            })
         } else {
             None
         }
+    }
+
+    /// Read cmd from a packet buffer.
+    #[inline]
+    pub fn read_cmd(buf: *const u8) -> u8 {
+        unsafe { *buf.wrapping_add(4) }
+    }
+
+    /// Write cmd to a packet buffer.
+    #[inline]
+    pub fn write_cmd(buf: *mut u8, cmd: u8) {
+        unsafe { *buf.wrapping_add(4) = cmd };
     }
 
     /// Maximum size of a data frame.

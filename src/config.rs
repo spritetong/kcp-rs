@@ -70,6 +70,10 @@ pub struct KcpConfig {
     pub rcv_wnd: u32,
     /// Stream mode
     pub stream: bool,
+    /// Connect timeout, default is 15 seconds
+    pub connect_timeout: Duration,
+    /// Session key
+    pub session_key: [u8; 16],
     /// Session expire duration, default is 90 seconds
     pub session_expire: Duration,
 }
@@ -82,6 +86,8 @@ impl Default for KcpConfig {
             snd_wnd: 32,
             rcv_wnd: 256,
             stream: true,
+            connect_timeout: Duration::from_secs(15),
+            session_key: [0; 16],
             session_expire: Duration::from_secs(90),
         }
     }
