@@ -57,6 +57,9 @@ impl KcpNoDelayConfig {
     }
 }
 
+/// Type of session key, 16 bytes
+pub type KcpSessionKey = [u8; 16];
+
 /// Kcp Config
 #[derive(Debug, Clone, Copy)]
 pub struct KcpConfig {
@@ -73,7 +76,7 @@ pub struct KcpConfig {
     /// Connect timeout, default is 15 seconds
     pub connect_timeout: Duration,
     /// Session key
-    pub session_key: [u8; 16],
+    pub session_key: KcpSessionKey,
     /// Session expire duration, default is 90 seconds
     pub session_expire: Duration,
 }

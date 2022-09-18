@@ -1,41 +1,42 @@
 #![allow(dead_code)]
-#![allow(unused_imports)]
 
 pub mod config;
 pub mod kcp;
-pub mod listener;
 pub mod stream;
+pub mod udp;
 
-use ::bytes::{Buf, BufMut, Bytes, BytesMut};
-use ::bytestring::ByteString;
-use ::crossbeam::atomic::AtomicCell;
+pub use crate::config::{KcpConfig, KcpNoDelayConfig, KcpSessionKey};
+pub use crate::stream::KcpStream;
+pub use crate::udp::KcpUdpStream;
+
+use ::bytes::{Bytes, BytesMut};
 use ::futures::{
     future::{poll_fn, ready},
     ready, FutureExt, Sink, SinkExt, Stream, StreamExt,
 };
-use ::log::{debug, error, trace, warn};
+use ::hashlink::LinkedHashMap;
+use ::log::{error, trace, warn};
 use ::std::{
+    collections::VecDeque,
     fmt::Display,
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    ops::{Deref, DerefMut},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    ops::Deref,
     pin::Pin,
-    slice, str,
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc,
-    },
+    sync::Arc,
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use ::tokio::{
-    net::UdpSocket,
+    net::{lookup_host, ToSocketAddrs, UdpSocket},
     select,
     sync::mpsc::{channel, Receiver, Sender},
     task::JoinHandle,
 };
 use ::tokio_stream::wrappers::ReceiverStream;
-use ::tokio_util::sync::{CancellationToken, PollSendError, PollSender};
+use ::tokio_util::{
+    codec::BytesCodec,
+    sync::{CancellationToken, PollSendError, PollSender},
+    udp::UdpFramed,
+};
 use ::zerocopy::{AsBytes, FromBytes};
-
-pub use config::{KcpConfig, KcpNoDelayConfig};

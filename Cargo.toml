@@ -14,16 +14,17 @@ default = []
 
 [dependencies]
 bytes = "1"
-bytestring = "1"
-crossbeam = "0.8"
 futures = "0.3"
+hashlink = "0.8"
 log = "0.4"
+rand = "0.8"
 tokio = { version = "1", features = ["net", "sync", "rt", "macros", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
-tokio-util = { version = "0.7", features = ["full"] }
-env_logger = "0.9"
-rand = "0.8"
+tokio-util = { version = "0.7", features = ["codec", "net"] }
 zerocopy = "0.6"
+
+[dev-dependencies]
+env_logger = "0.9"
 
 [build-dependencies]
 build-helper2 = { git = "https://git.whiftec.com/git/rust/build-helper2.git" }

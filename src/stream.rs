@@ -3,13 +3,11 @@ use crate::*;
 
 pub struct KcpStream {
     config: Arc<KcpConfig>,
-    id: ByteString,
     conv: u32,
     msg_sink: PollSender<Message>,
     data_rx: Receiver<Data>,
     token: CancellationToken,
     task: Option<JoinHandle<()>>,
-    is_running: bool,
 }
 
 #[derive(Debug)]
@@ -28,13 +26,13 @@ enum Message {
 }
 
 impl KcpStream {
-    const SYN_CONV: u32 = u32::MAX;
+    pub const SYN_CONV: u32 = 0xFFFF_FFFE;
 
-    pub(crate) fn new<S, R>(
+    pub(crate) fn new<S, R, D>(
         config: Arc<KcpConfig>,
-        id: ByteString,
         sink: S,
         stream: R,
+        disconnect: D,
         token: Option<CancellationToken>,
     ) -> Self
     where
@@ -42,29 +40,36 @@ impl KcpStream {
         S::Error: Display,
         R: Stream + Send + Unpin + 'static,
         R::Item: Into<Bytes> + Send + 'static,
+        D: Sink<u32> + Send + Unpin + 'static,
     {
         let token = token.unwrap_or_else(CancellationToken::new);
         let (msg_tx, msg_rx) = channel(config.snd_wnd.max(8) as usize);
         let (data_tx, data_rx) = channel(config.rcv_wnd.max(16) as usize);
 
-        let task = Task::new(config.clone(), sink, stream, msg_rx, data_tx, token.clone());
+        let task = Task::new(
+            config.clone(),
+            sink,
+            stream,
+            disconnect,
+            msg_rx,
+            data_tx,
+            token.clone(),
+        );
         Self {
             config,
-            id,
             conv: 0,
             msg_sink: PollSender::new(msg_tx),
             data_rx,
             token,
             task: Some(tokio::spawn(task.run())),
-            is_running: true,
         }
     }
 
-    pub async fn connect<S, R>(
+    pub async fn connect<S, R, D>(
         config: Arc<KcpConfig>,
-        id: ByteString,
         sink: S,
         stream: R,
+        disconnect: D,
         token: Option<CancellationToken>,
     ) -> io::Result<Self>
     where
@@ -72,18 +77,19 @@ impl KcpStream {
         S::Error: Display,
         R: Stream + Send + Unpin + 'static,
         R::Item: Into<Bytes> + Send + 'static,
+        D: Sink<u32> + Send + Unpin + 'static,
     {
-        Self::new(config.clone(), id, sink, stream, token)
+        Self::new(config.clone(), sink, stream, disconnect, token)
             .wait_connection(Message::Connect)
             .await
     }
 
-    pub async fn accept<S, R>(
+    pub async fn accept<S, R, D>(
         config: Arc<KcpConfig>,
         conv: u32,
-        id: ByteString,
         sink: S,
         stream: R,
+        disconnect: D,
         token: Option<CancellationToken>,
     ) -> io::Result<Self>
     where
@@ -91,13 +97,25 @@ impl KcpStream {
         S::Error: Display,
         R: Stream + Send + Unpin + 'static,
         R::Item: Into<Bytes> + Send + 'static,
+        D: Sink<u32> + Send + Unpin + 'static,
     {
-        if conv == Self::SYN_CONV {
+        if conv == 0 || conv == Self::SYN_CONV {
+            error!("Invalid conv 0x{:08X}", Self::SYN_CONV);
             return Err(io::ErrorKind::InvalidInput.into());
         }
-        Self::new(config.clone(), id, sink, stream, token)
+        Self::new(config.clone(), sink, stream, disconnect, token)
             .wait_connection(Message::Accept { conv })
             .await
+    }
+
+    #[inline]
+    pub fn config(&self) -> Arc<KcpConfig> {
+        self.config.clone()
+    }
+
+    #[inline]
+    pub fn conv(&self) -> u32 {
+        self.conv
     }
 
     pub async fn flush(&mut self) -> io::Result<()> {
@@ -107,23 +125,7 @@ impl KcpStream {
             .map_err(|_| io::Error::from(io::ErrorKind::NotConnected))
     }
 
-    async fn wait_connection(mut self, msg: Message) -> io::Result<Self> {
-        self.msg_sink.send(msg).await.unwrap();
-        match tokio::time::timeout(self.config.connect_timeout, self.data_rx.recv()).await {
-            Ok(Some(Data::Connected { conv })) => {
-                trace!("Accept a connection, conv {}", conv);
-                self.conv = conv;
-                Ok(self)
-            }
-            Ok(Some(Data::Disconnect(err))) => {
-                trace!("Disconnect conv {}: {}", self.conv, err);
-                Err(err.into())
-            }
-            Ok(_) => Err(io::ErrorKind::NotConnected.into()),
-            _ => Err(io::ErrorKind::TimedOut.into()),
-        }
-    }
-
+    /// Generate a random conv.
     pub fn rand_conv() -> u32 {
         loop {
             let conv = rand::random();
@@ -133,9 +135,28 @@ impl KcpStream {
         }
     }
 
+    async fn wait_connection(mut self, msg: Message) -> io::Result<Self> {
+        self.msg_sink.send(msg).await.unwrap();
+        let rst = match tokio::time::timeout(self.config.connect_timeout, self.data_rx.recv()).await
+        {
+            Ok(Some(Data::Connected { conv })) => {
+                trace!("Connect conv {}", conv);
+                self.conv = conv;
+                return Ok(self);
+            }
+            Ok(Some(Data::Disconnect(err))) => {
+                trace!("Disconnect conv {}: {}", self.conv, err);
+                Err(err.into())
+            }
+            Ok(_) => Err(io::ErrorKind::NotConnected.into()),
+            _ => Err(io::ErrorKind::TimedOut.into()),
+        };
+        self.close().await.ok();
+        rst
+    }
+
     fn try_close(&mut self) {
-        if self.is_running {
-            self.is_running = false;
+        if !self.token.is_cancelled() {
             self.token.cancel();
             self.data_rx.close();
         }
@@ -145,22 +166,24 @@ impl KcpStream {
 impl Drop for KcpStream {
     fn drop(&mut self) {
         self.try_close();
-        self.task.take();
     }
 }
+
+////////////////////////////////////////////////////////////////////////////////
 
 #[derive(Clone, Copy, Default, AsBytes, FromBytes)]
 #[repr(C)]
 struct SynData {
-    id: [u8; 16],
-    key: [u8; 16],
+    key: KcpSessionKey,
+    id: KcpSessionKey,
 }
 
-struct Task<S, R> {
+struct Task<S, R, D> {
     kcp: Kcp,
     config: Arc<KcpConfig>,
     sink: S,
     stream: R,
+    disconnect: D,
     msg_rx: Receiver<Message>,
     data_tx: Sender<Data>,
     token: CancellationToken,
@@ -168,10 +191,11 @@ struct Task<S, R> {
     tx_frame: Option<Bytes>,
 
     states: u32,
-    session_id: [u8; 16],
+    last_io_time: u32,
+    session_id: KcpSessionKey,
 }
 
-impl<S, R> Task<S, R> {
+impl<S, R, D> Task<S, R, D> {
     const RESET: u32 = 0x04;
     const CLOSED: u32 = 0x08;
 
@@ -183,19 +207,23 @@ impl<S, R> Task<S, R> {
     const KCP_SYN: u8 = 0x80;
     const KCP_FIN: u8 = 0x20;
     const KCP_RESET: u8 = 0x08;
+
+    const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 }
 
-impl<S, R> Task<S, R>
+impl<S, R, D> Task<S, R, D>
 where
     S: Sink<Bytes> + Unpin,
     S::Error: Display,
     R: Stream + Unpin,
     R::Item: Into<Bytes>,
+    D: Sink<u32> + Send + Unpin,
 {
     fn new(
         config: Arc<KcpConfig>,
         sink: S,
         stream: R,
+        disconnect: D,
         msg_rx: Receiver<Message>,
         data_tx: Sender<Data>,
         token: CancellationToken,
@@ -205,24 +233,24 @@ where
             config,
             sink,
             stream,
+            disconnect,
             msg_rx,
             data_tx,
             token,
             rx_buf: BytesMut::new(),
             tx_frame: None,
             states: 0,
+            last_io_time: 0,
             session_id: Default::default(),
         }
     }
 
     async fn run(mut self) {
-        // TODO: enable all KCP logs.
-        //self.kcp.logmask = i32::MAX;
-
         self.kcp.initialize();
         self.kcp_apply_config();
         // Prepare for SYN handshake.
         self.kcp.set_nodelay(true, 100, 0, false);
+        self.last_io_time = self.kcp.current();
 
         let data_tx = self.data_tx.clone();
         loop {
@@ -233,7 +261,11 @@ where
                     _ = self.token.cancelled() => break,
                 }
             }
-            if self.kcp.is_dead_link() {
+
+            if self.kcp.is_dead_link()
+                || self.kcp.duration_since(self.last_io_time)
+                    >= (self.config.session_expire.as_secs() * 1000) as u32
+            {
                 // TODO:
                 break;
             }
@@ -275,8 +307,8 @@ where
                     }
                 }
 
-                v = self.stream.next() => {
-                    match v {
+                x = self.stream.next() => {
+                    match x {
                          Some(data) => {
                             self.kcp_input(data.into());
                             // Try to receive more.
@@ -311,8 +343,21 @@ where
             }
         }
 
-        self.token.cancel();
         self.msg_rx.close();
+
+        // Report disconnect.
+        if tokio::time::timeout(
+            Self::DISCONNECT_TIMEOUT,
+            self.disconnect.send(self.kcp.conv()),
+        )
+        .await
+        .is_err()
+        {
+            error!(
+                "timeout to send disonnect message, conv {}",
+                self.kcp.conv()
+            );
+        }
     }
 
     #[inline]
@@ -352,13 +397,7 @@ where
 
                     // Connection has been established.
                     self.states &= !Self::SYN_HANDSHAKE;
-                    // Apply nodelay configuration.
-                    self.kcp.set_nodelay(
-                        self.config.nodelay.nodelay,
-                        self.config.nodelay.interval,
-                        self.config.nodelay.resend,
-                        self.config.nodelay.nc,
-                    );
+                    self.kcp_apply_nodelay();
                     self.data_tx
                         .try_send(Data::Connected {
                             conv: self.kcp.conv(),
@@ -434,12 +473,7 @@ where
         self.kcp.set_mtu(self.config.mtu).unwrap();
         self.kcp
             .set_wndsize(self.config.snd_wnd, self.config.rcv_wnd);
-        self.kcp.set_nodelay(
-            self.config.nodelay.nodelay,
-            self.config.nodelay.interval,
-            self.config.nodelay.resend,
-            self.config.nodelay.nc,
-        );
+        self.kcp_apply_nodelay();
 
         // Resize buffer.
         let size = self.config.mtu as usize * 3;
@@ -448,11 +482,21 @@ where
         }
     }
 
+    fn kcp_apply_nodelay(&mut self) {
+        self.kcp.set_nodelay(
+            self.config.nodelay.nodelay,
+            self.config.nodelay.interval,
+            self.config.nodelay.resend,
+            self.config.nodelay.nc,
+        );
+    }
+
     fn kcp_flush(&mut self) {
         if self.test_state(Self::FLUSH) {
             self.states ^= Self::FLUSH;
             self.kcp.update(self.kcp.get_system_time());
             self.kcp.flush();
+            self.last_io_time = self.kcp.current();
         }
     }
 
@@ -500,7 +544,6 @@ impl Stream for KcpStream {
             match data {
                 Data::Disconnect(err) => {
                     trace!("Disconnect conv {}: {}", self.conv, err);
-                    break;
                 }
                 Data::Frame(data) => return Poll::Ready(Some(data)),
                 _ => (),
@@ -559,24 +602,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream() {
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace"))
+            .format_timestamp_micros()
+            .is_test(true)
+            .try_init()
+            .ok();
 
         let addr1: SocketAddr = "127.0.0.1:4321".parse().unwrap();
         let addr2: SocketAddr = "127.0.0.1:4322".parse().unwrap();
 
-        let (sink, stream) = tokio_util::udp::UdpFramed::new(
-            UdpSocket::bind(addr1).await.unwrap(),
-            tokio_util::codec::BytesCodec::new(),
-        )
-        .split();
+        let (sink, stream) =
+            UdpFramed::new(UdpSocket::bind(addr1).await.unwrap(), BytesCodec::new()).split();
         let stream1 = stream.filter_map(|x| ready(x.ok().map(|(x, _)| x)));
         let sink1 = sink.with(move |x: Bytes| ready(io::Result::Ok((x, addr2))));
 
         let udp2 = Arc::new(UdpSocket::bind(addr2).await.unwrap());
-        let stream2 =
-            tokio_util::udp::UdpFramed::new(udp2.clone(), tokio_util::codec::BytesCodec::new())
-                .filter_map(|x| ready(x.ok().map(|(x, _)| x)));
-        let sink2 = tokio_util::udp::UdpFramed::new(udp2, tokio_util::codec::BytesCodec::new())
+        let stream2 = UdpFramed::new(udp2.clone(), BytesCodec::new())
+            .filter_map(|x| ready(x.ok().map(|(x, _)| x)));
+        let sink2 = UdpFramed::new(udp2, BytesCodec::new())
             .with(move |x: Bytes| ready(io::Result::Ok((x, addr1))));
 
         let config = Arc::new(KcpConfig {
@@ -589,28 +632,28 @@ mod tests {
             KcpStream::accept(
                 config.clone(),
                 KcpStream::rand_conv(),
-                addr2.to_string().into(),
                 sink1,
                 stream1,
+                futures::sink::drain(),
                 None,
             ),
-            KcpStream::connect(config, addr1.to_string().into(), sink2, stream2, None),
+            KcpStream::connect(config, sink2, stream2, futures::sink::drain(), None),
         );
-        let mut s1 = s1.unwrap();
-        let mut s2 = s2.unwrap();
+        let mut s1 = Box::new(s1.unwrap());
+        let mut s2 = Box::new(s2.unwrap());
 
         s1.send(Bytes::from_static(b"12345")).await.unwrap();
         println!("{:?}", s2.next().await);
 
         let frame = Bytes::from(vec![0u8; 300000]);
-        let start = Instant::now();
+        let start = std::time::Instant::now();
         let mut received = 0;
         while start.elapsed() < Duration::from_secs(10) {
             select! {
                 _ = s1.send(frame.clone()) => (),
-                Some(v) = s2.next() => {
-                    //trace!("received {}", v.len());
-                    received += v.len();
+                Some(x) = s2.next() => {
+                    //trace!("received {}", x.len());
+                    received += x.len();
                 }
             }
         }

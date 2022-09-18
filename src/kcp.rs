@@ -1,5 +1,5 @@
-use bytes::{Buf, Bytes, BytesMut};
-use std::{
+use ::bytes::{Bytes, BytesMut};
+use ::std::{
     collections::VecDeque,
     ffi::CStr,
     io,
@@ -217,6 +217,8 @@ impl Kcp {
 
     pub fn set_conv(&mut self, conv: u32) {
         self.as_mut().conv = conv;
+        // TODO: enable all KCP logs.
+        //self.as_mut().logmask = i32::MAX;
     }
 
     pub fn set_stream(&mut self, stream: bool) {
@@ -274,6 +276,27 @@ impl Kcp {
     #[inline]
     pub fn write_cmd(buf: *mut u8, cmd: u8) {
         unsafe { *buf.wrapping_add(4) = cmd };
+    }
+
+    /// Get the first segment payload from a packet buffer.
+    #[inline]
+    pub fn read_payload_data(buf: &[u8]) -> Option<&[u8]> {
+        unsafe {
+            let mut p = buf.as_ptr();
+            let mut left = buf.len();
+            while left >= IKCP_OVERHEAD as usize {
+                let len = (*p.wrapping_add(IKCP_OVERHEAD as usize - 4) as usize)
+                    | (*p.wrapping_add(IKCP_OVERHEAD as usize - 3) as usize).wrapping_shl(8)
+                    | (*p.wrapping_add(IKCP_OVERHEAD as usize - 2) as usize).wrapping_shl(16)
+                    | (*p.wrapping_add(IKCP_OVERHEAD as usize - 1) as usize).wrapping_shl(24);
+                p = p.wrapping_add(IKCP_OVERHEAD as usize);
+                left -= IKCP_OVERHEAD as usize;
+                if (1..=left).contains(&len) {
+                    return Some(slice::from_raw_parts(p, len));
+                }
+            }
+        }
+        None
     }
 
     /// Maximum size of a data frame.
