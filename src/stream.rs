@@ -8,6 +8,8 @@ pub struct KcpStream {
     data_rx: Receiver<Data>,
     token: CancellationToken,
     task: Option<JoinHandle<()>>,
+    // for AsyncRead
+    read_buf: Option<Bytes>,
 }
 
 #[derive(Debug)]
@@ -62,6 +64,7 @@ impl KcpStream {
             data_rx,
             token,
             task: Some(tokio::spawn(task.run())),
+            read_buf: None,
         }
     }
 
@@ -537,15 +540,18 @@ where
 }
 
 impl Stream for KcpStream {
-    type Item = Bytes;
+    type Item = io::Result<Bytes>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.read_buf.is_some() {
+            return Poll::Ready(Some(Ok(self.read_buf.take().unwrap())));
+        }
         while let Some(data) = ready!(self.data_rx.poll_recv(cx)) {
             match data {
                 Data::Disconnect(err) => {
                     trace!("Disconnect conv {}: {}", self.conv, err);
                 }
-                Data::Frame(data) => return Poll::Ready(Some(data)),
+                Data::Frame(data) => return Poll::Ready(Some(Ok(data))),
                 _ => (),
             }
         }
@@ -583,6 +589,99 @@ impl Sink<Bytes> for KcpStream {
             this.task.take();
         }
         Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncRead for KcpStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+
+        let mut written = 0;
+        while buf.remaining() > 0 {
+            if let Some(ref mut chunk) = this.read_buf {
+                let len = chunk.len().min(buf.remaining());
+                buf.put_slice(&chunk[..len]);
+                written += len;
+                if len < chunk.len() {
+                    let _ = chunk.split_to(len);
+                } else {
+                    this.read_buf = None;
+                }
+            } else {
+                match this.poll_next_unpin(cx) {
+                    Poll::Ready(Some(Ok(chunk))) => {
+                        if !chunk.is_empty() {
+                            this.read_buf = Some(chunk);
+                        }
+                    }
+                    Poll::Ready(Some(Err(err))) => return Poll::Ready(Err(err)),
+                    Poll::Ready(None) => break,
+                    Poll::Pending => {
+                        if written > 0 {
+                            break;
+                        }
+                        return Poll::Pending;
+                    }
+                }
+            }
+        }
+
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for KcpStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        let this = self.get_mut();
+        let mut len = 0;
+
+        for chunk in buf.chunks(Kcp::max_frame_size(this.config.mtu) as usize) {
+            match this.poll_ready_unpin(cx) {
+                Poll::Ready(Ok(_)) => {
+                    if let Err(e) = this.start_send_unpin(Bytes::copy_from_slice(chunk)) {
+                        if len > 0 {
+                            break;
+                        }
+                        return Poll::Ready(Err(e));
+                    }
+                    len += chunk.len();
+                }
+                Poll::Ready(Err(e)) => {
+                    if len > 0 {
+                        break;
+                    }
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => {
+                    if len > 0 {
+                        break;
+                    }
+                    return Poll::Pending;
+                }
+            }
+        }
+
+        Poll::Ready(Ok(len))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        self.poll_close(cx)
     }
 }
 
@@ -651,7 +750,7 @@ mod tests {
         while start.elapsed() < Duration::from_secs(10) {
             select! {
                 _ = s1.send(frame.clone()) => (),
-                Some(x) = s2.next() => {
+                Some(Ok(x)) = s2.next() => {
                     //trace!("received {}", x.len());
                     received += x.len();
                 }

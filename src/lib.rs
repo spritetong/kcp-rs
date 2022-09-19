@@ -28,6 +28,7 @@ use ::std::{
     time::Duration,
 };
 use ::tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{lookup_host, ToSocketAddrs, UdpSocket},
     select,
     sync::mpsc::{channel, Receiver, Sender},

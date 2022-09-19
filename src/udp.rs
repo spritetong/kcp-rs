@@ -3,7 +3,7 @@ use crate::*;
 
 pub struct KcpUdpStream {
     config: Arc<KcpConfig>,
-    stream_rx: Receiver<KcpStream>,
+    stream_rx: Receiver<(KcpStream, SocketAddr)>,
     token: CancellationToken,
     task: Option<JoinHandle<()>>,
 }
@@ -29,7 +29,7 @@ impl KcpUdpStream {
         let backlog = backlog.max(8);
         let (stream_tx, stream_rx) = channel(backlog);
         let (msg_tx, msg_rx) = channel(backlog);
-        let (data_tx, data_rx) = channel::<RxData>(Task::DATA_QUEUE_SIZE);
+        let (data_tx, data_rx) = channel(Task::DATA_QUEUE_SIZE);
         let task = Task::new(
             config.clone(),
             backlog,
@@ -46,7 +46,7 @@ impl KcpUdpStream {
         })
     }
 
-    pub async fn accept(&mut self) -> io::Result<KcpStream> {
+    pub async fn accept(&mut self) -> io::Result<(KcpStream, SocketAddr)> {
         self.stream_rx
             .recv()
             .await
@@ -67,7 +67,7 @@ impl KcpUdpStream {
     pub async fn connect<A: ToSocketAddrs>(
         config: Arc<KcpConfig>,
         addr: A,
-    ) -> io::Result<KcpStream> {
+    ) -> io::Result<(KcpStream, SocketAddr)> {
         let addr = lookup_host(addr)
             .await?
             .next()
@@ -80,14 +80,14 @@ impl KcpUdpStream {
         };
         let udp = UdpSocket::bind(local_addr).await?;
 
-        Self::socket_connect(config, udp, addr).await
+        Self::socket_connect(config, addr, udp).await
     }
 
     pub async fn socket_connect<A: ToSocketAddrs>(
         config: Arc<KcpConfig>,
-        udp: UdpSocket,
         addr: A,
-    ) -> io::Result<KcpStream> {
+        udp: UdpSocket,
+    ) -> io::Result<(KcpStream, SocketAddr)> {
         let addr = lookup_host(addr)
             .await?
             .next()
@@ -97,7 +97,9 @@ impl KcpUdpStream {
         let sink = sink.with(move |x: Bytes| ready(io::Result::Ok((x, addr))));
         let stream = stream.filter_map(|x| ready(x.ok().map(|(x, _)| x)));
 
-        KcpStream::connect(config, sink, stream, futures::sink::drain(), None).await
+        KcpStream::connect(config, sink, stream, futures::sink::drain(), None)
+            .await
+            .map(|x| (x, addr))
     }
 }
 
@@ -111,7 +113,7 @@ impl Drop for KcpUdpStream {
 }
 
 impl Stream for KcpUdpStream {
-    type Item = KcpStream;
+    type Item = (KcpStream, SocketAddr);
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.stream_rx.poll_recv(cx)
@@ -142,7 +144,7 @@ enum Message {
 struct Task {
     config: Arc<KcpConfig>,
     backlog: usize,
-    stream_tx: Sender<KcpStream>,
+    stream_tx: Sender<(KcpStream, SocketAddr)>,
     msg_tx: Sender<Message>,
     data_tx: Sender<RxData>,
     token: CancellationToken,
@@ -169,7 +171,7 @@ impl Task {
     fn new(
         config: Arc<KcpConfig>,
         backlog: usize,
-        stream_tx: Sender<KcpStream>,
+        stream_tx: Sender<(KcpStream, SocketAddr)>,
         msg_tx: Sender<Message>,
         data_tx: Sender<RxData>,
         token: CancellationToken,
@@ -229,11 +231,11 @@ impl Task {
                                     self.accept_task_count -= 1;
                                     let _ = task.await;
                                 }
-                            }
-                            // TODO:
-                            select! {
-                                _ = self.stream_tx.send(stream) => (),
-                                _ = token.cancelled() => (),
+                                // TODO:
+                                select! {
+                                    _ = self.stream_tx.send((stream, session.peer_addr)) => (),
+                                    _ = token.cancelled() => (),
+                                }
                             }
                         }
                         Message::Disconnect { conv } => {
@@ -374,8 +376,8 @@ impl Task {
 
     async fn remove_session(&mut self, mut session: Session) {
         self.sid_map.remove(&session.session_id);
-        session.token.cancel();
         if let Some(task) = session.task.take() {
+            session.token.cancel();
             self.accept_task_count -= 1;
             let _ = task.await;
         }
@@ -417,13 +419,13 @@ mod tests {
                 server.next(),
             );
             //error!("before close");
-            x.unwrap().close().await.ok();
-            y.unwrap().close().await.ok();
+            x.unwrap().0.close().await.ok();
+            y.unwrap().0.close().await.ok();
             //error!("after close");
         }
 
-        let mut s1 = s1.unwrap();
-        let mut s2 = s2.unwrap();
+        let mut s1 = s1.unwrap().0;
+        let mut s2 = s2.unwrap().0;
 
         s1.send(Bytes::from_static(b"12345")).await.unwrap();
         println!("{:?}", s2.next().await);
@@ -434,7 +436,7 @@ mod tests {
         while start.elapsed() < Duration::from_secs(10) {
             select! {
                 _ = s1.send(frame.clone()) => (),
-                Some(x) = s2.next() => {
+                Some(Ok(x)) = s2.next() => {
                     //trace!("received {}", x.len());
                     received += x.len();
                 }

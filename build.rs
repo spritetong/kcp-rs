@@ -2,9 +2,9 @@ use build_helper2::*;
 
 fn main() -> io::Result<()> {
     // Do not slow down rust-analyze.
-    if cmake::is_under_rust_analyzer(true) {
-        return Ok(());
-    }
+    //if cmake::is_under_rust_analyzer(true) {
+    //    return Ok(());
+    //}
 
     let root = cargo::manifest::dir();
     let src_dir = root.join("src");
