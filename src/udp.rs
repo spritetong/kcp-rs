@@ -105,10 +105,8 @@ impl KcpUdpStream {
 
 impl Drop for KcpUdpStream {
     fn drop(&mut self) {
-        if !self.token.is_cancelled() {
-            self.token.cancel();
-            self.stream_rx.close();
-        }
+        self.token.cancel();
+        self.stream_rx.close();
     }
 }
 

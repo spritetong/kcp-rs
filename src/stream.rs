@@ -159,10 +159,8 @@ impl KcpStream {
     }
 
     fn try_close(&mut self) {
-        if !self.token.is_cancelled() {
-            self.token.cancel();
-            self.data_rx.close();
-        }
+        self.token.cancel();
+        self.data_rx.close();
     }
 }
 
@@ -281,38 +279,48 @@ where
             }
 
             select! {
-                Some(msg) = self.msg_rx.recv(), if !self.kcp.is_send_queue_full() => {
-                    self.process_msg(msg);
-                    // Try to process more.
-                    while !self.kcp.is_send_queue_full() {
-                        match self.msg_rx.try_recv() {
-                            Ok(msg) => self.process_msg(msg),
-                            _ => break,
+                x = self.msg_rx.recv(), if !self.kcp.is_send_queue_full() => {
+                    match x {
+                        Some(msg) => {
+                            self.process_msg(msg);
+                            // Try to process more.
+                            while !self.kcp.is_send_queue_full() {
+                                match self.msg_rx.try_recv() {
+                                    Ok(msg) => self.process_msg(msg),
+                                    _ => break,
+                                }
+                            }
+                            // Try to flush.
+                            self.kcp_flush();
                         }
+                        _ => break,
                     }
-                    // Try to flush.
-                    self.kcp_flush();
                 }
 
-                Ok(permit) = data_tx.reserve(), if self.tx_frame.is_some() => {
-                    if let Some(data) = self.tx_frame.take() {
-                        permit.send(Data::Frame(data));
-                    }
-                    while let Some(data) = self.kcp.recv_bytes() {
-                        match data_tx.try_reserve() {
-                            Ok(permit) => permit.send(Data::Frame(data)),
-                            _ => {
-                                // Save the data frame.
-                                self.tx_frame = Some(data);
-                                break;
+                x = data_tx.reserve(), if self.tx_frame.is_some() => {
+                    match x {
+                        Ok(permit) => {
+                            if let Some(data) = self.tx_frame.take() {
+                                permit.send(Data::Frame(data));
+                            }
+                            while let Some(data) = self.kcp.recv_bytes() {
+                                match data_tx.try_reserve() {
+                                    Ok(permit) => permit.send(Data::Frame(data)),
+                                    _ => {
+                                        // Save the data frame.
+                                        self.tx_frame = Some(data);
+                                        break;
+                                    }
+                                }
                             }
                         }
+                        _ => break,
                     }
                 }
 
                 x = self.stream.next() => {
                     match x {
-                         Some(data) => {
+                        Some(data) => {
                             self.kcp_input(data.into());
                             // Try to receive more.
                             poll_fn(|cx| {
@@ -336,8 +344,8 @@ where
                             }
                             // Try to flush.
                             self.kcp_flush();
-                         }
-                         _ => break,
+                        }
+                        _ => break,
                     }
                 }
 
@@ -598,35 +606,32 @@ impl AsyncRead for KcpStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
         let this = self.get_mut();
 
-        let mut written = 0;
-        while buf.remaining() > 0 {
-            if let Some(ref mut chunk) = this.read_buf {
-                let len = chunk.len().min(buf.remaining());
-                buf.put_slice(&chunk[..len]);
-                written += len;
-                if len < chunk.len() {
-                    let _ = chunk.split_to(len);
-                } else {
-                    this.read_buf = None;
+        while this.read_buf.is_none() {
+            match this.poll_next_unpin(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    if !chunk.is_empty() {
+                        this.read_buf = Some(chunk);
+                    }
                 }
+                Poll::Ready(Some(Err(err))) => return Poll::Ready(Err(err)),
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        if let Some(ref mut chunk) = this.read_buf {
+            let len = chunk.len().min(buf.remaining());
+            buf.put_slice(&chunk[..len]);
+            if len < chunk.len() {
+                let _ = chunk.split_to(len);
             } else {
-                match this.poll_next_unpin(cx) {
-                    Poll::Ready(Some(Ok(chunk))) => {
-                        if !chunk.is_empty() {
-                            this.read_buf = Some(chunk);
-                        }
-                    }
-                    Poll::Ready(Some(Err(err))) => return Poll::Ready(Err(err)),
-                    Poll::Ready(None) => break,
-                    Poll::Pending => {
-                        if written > 0 {
-                            break;
-                        }
-                        return Poll::Pending;
-                    }
-                }
+                this.read_buf = None;
             }
         }
 
