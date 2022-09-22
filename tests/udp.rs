@@ -2,7 +2,7 @@ use ::kcp::udp::*;
 
 use ::bytes::Bytes;
 use ::futures::{SinkExt, StreamExt};
-use ::log::error;
+use ::log::info;
 use ::std::{sync::Arc, time::Duration};
 use ::tokio::select;
 
@@ -15,7 +15,7 @@ async fn test_udp_stream() {
         .ok();
 
     let config = Arc::new(KcpConfig {
-        nodelay: KcpNoDelayConfig::normal(),
+        nodelay: KcpNoDelayConfig::fastest(),
         session_key: rand::random(),
         ..Default::default()
     });
@@ -31,36 +31,47 @@ async fn test_udp_stream() {
     );
 
     for _ in 0..5 {
-        //error!("start");
+        //info!("start");
         let (x, y) = tokio::join!(
             KcpUdpStream::connect(config.clone(), server_addr),
             server.next(),
         );
-        //error!("before close");
+        //info!("before close");
         x.unwrap().0.close().await.ok();
         y.unwrap().0.close().await.ok();
-        //error!("after close");
+        //info!("after close");
     }
 
     let mut s1 = s1.unwrap().0;
     let mut s2 = s2.unwrap().0;
 
     s1.send(Bytes::from_static(b"12345")).await.unwrap();
-    println!("{:?}", s2.next().await);
+    info!("{:?}", s2.next().await);
 
     let frame = Bytes::from(vec![0u8; 300000]);
     let start = std::time::Instant::now();
     let mut received = 0;
+    let mut sent = 0;
     while start.elapsed() < Duration::from_secs(10) {
         select! {
-            _ = s1.send(frame.clone()) => (),
+            _ = s1.send(frame.clone()) => {
+                sent += frame.len();
+            },
             Some(Ok(x)) = s2.next() => {
-                //trace!("received {}", x.len());
                 received += x.len();
             }
         }
     }
-    error!("total received {}", received);
+    while received < sent {
+        match s2.next().await {
+            Some(Ok(x)) => {
+                received += x.len();
+            }
+            _ => break,
+        }
+    }
+    info!("total sent {}, total received {}", sent, received);
+    assert_eq!(sent, received);
 
     s1.close().await.unwrap();
     s2.close().await.unwrap();
