@@ -1,4 +1,4 @@
-use build_helper2::*;
+use smart_build::*;
 
 fn main() -> io::Result<()> {
     let root = cargo::manifest::dir();

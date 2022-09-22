@@ -400,8 +400,8 @@ impl Task {
     async fn remove_session(&mut self, mut session: Session) {
         self.sid_map.remove(&session.session_id);
         if let Some(task) = session.task.take() {
-            session.token.cancel();
             self.accept_task_count -= 1;
+            session.token.cancel();
             let _ = task.await;
         }
     }

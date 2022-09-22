@@ -1,6 +1,6 @@
 [package]
 name = "kcp-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 build = "build.rs"
 
@@ -29,5 +29,5 @@ zerocopy = "0.6"
 env_logger = "0.9"
 
 [build-dependencies]
-build-helper2 = { git = "https://git.whiftec.com/git/rust/build-helper2.git" }
+smart-build = { git = "https://git.whiftec.com/git/rust/smart-build.git" }
 cc = { version = "1.0" }
