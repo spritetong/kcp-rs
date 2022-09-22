@@ -5,22 +5,24 @@ edition = "2021"
 build = "build.rs"
 
 [lib]
-name = "kcp_rs"
+name = "kcp"
 path = "src/lib.rs"
 
 [features]
-default = []
+default = ["udp"]
+stream = ["futures", "tokio", "tokio-stream", "tokio-util"]
+udp = ["stream", "hashlink"]
 #gen-ffi = []
 
 [dependencies]
 bytes = "1"
-futures = "0.3"
-hashlink = "0.8"
+futures = { version = "0.3", optional = true }
+hashlink = { version = "0.8", optional = true }
 log = "0.4"
 rand = "0.8"
-tokio = { version = "1", features = ["net", "sync", "rt", "macros", "time"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
-tokio-util = { version = "0.7", features = ["codec", "io", "net"] }
+tokio = { version = "1", features = ["net", "sync", "rt", "macros", "time"], optional = true }
+tokio-stream = { version = "0.1", features = ["sync"], optional = true }
+tokio-util = { version = "0.7", features = ["codec", "io", "net"], optional = true }
 zerocopy = "0.6"
 
 [dev-dependencies]
@@ -28,4 +30,4 @@ env_logger = "0.9"
 
 [build-dependencies]
 build-helper2 = { git = "https://git.whiftec.com/git/rust/build-helper2.git" }
-cc = { version = "1.0", features = ["parallel"] }
+cc = { version = "1.0" }

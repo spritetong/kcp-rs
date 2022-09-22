@@ -68,7 +68,7 @@ impl Kcp {
             .wrapping_add(elapsed.subsec_millis())
     }
 
-    /// # Notice
+    /// # Warning
     ///
     /// After initialization, self must be ***pinned*** in memory.
     pub fn initialize(&mut self) {
@@ -215,10 +215,12 @@ impl Kcp {
         (self.current().wrapping_sub(since) as i32).max(0) as u32
     }
 
+    pub fn set_logmask(&mut self, logmask: u32) {
+        self.as_mut().logmask = logmask as i32;
+    }
+
     pub fn set_conv(&mut self, conv: u32) {
         self.as_mut().conv = conv;
-        // TODO: enable all KCP logs.
-        //self.as_mut().logmask = i32::MAX;
     }
 
     pub fn set_stream(&mut self, stream: bool) {
@@ -268,14 +270,14 @@ impl Kcp {
 
     /// Read cmd from a packet buffer.
     #[inline]
-    pub fn read_cmd(buf: *const u8) -> u8 {
-        unsafe { *buf.wrapping_add(4) }
+    pub fn read_cmd(buf: &[u8]) -> u8 {
+        buf[4]
     }
 
     /// Write cmd to a packet buffer.
     #[inline]
-    pub fn write_cmd(buf: *mut u8, cmd: u8) {
-        unsafe { *buf.wrapping_add(4) = cmd };
+    pub fn write_cmd(buf: &mut [u8], cmd: u8) {
+        buf[4] = cmd;
     }
 
     /// Get the first segment payload from a packet buffer.

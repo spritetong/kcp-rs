@@ -1,11 +1,6 @@
 use build_helper2::*;
 
 fn main() -> io::Result<()> {
-    // Do not slow down rust-analyze.
-    //if cmake::is_under_rust_analyzer(true) {
-    //    return Ok(());
-    //}
-
     let root = cargo::manifest::dir();
     let src_dir = root.join("src");
     let kcp_dir = root.join("kcp");
@@ -24,6 +19,11 @@ fn main() -> io::Result<()> {
         .flag_if_supported("-Wno-unused-parameter")
         .files(&sources)
         .compile("kcp_sys");
+
+    // Watch changes of sources.
+    for src in sources.iter() {
+        rerun_if_changed(src);
+    }
 
     if cargo::features::enabled("gen-ffi") {
         // Generate the FFI file.
@@ -54,11 +54,6 @@ fn main() -> io::Result<()> {
             ["__.*"],
             |x| Some(x.derive_default(false).derive_debug(false)),
         )?;
-    }
-
-    // Watch changes of sources.
-    for src in sources.iter() {
-        rerun_if_changed(src);
     }
 
     Ok(())

@@ -1,5 +1,32 @@
-use crate::kcp::Kcp;
-use crate::*;
+use crate::protocol::Kcp;
+pub use crate::stream::*;
+
+use ::bytes::Bytes;
+use ::futures::{
+    future::{poll_fn, ready},
+    SinkExt, Stream, StreamExt,
+};
+use ::hashlink::LinkedHashMap;
+use ::std::{
+    collections::VecDeque,
+    io,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
+use ::tokio::{
+    net::{lookup_host, ToSocketAddrs, UdpSocket},
+    select,
+    sync::mpsc::{channel, Receiver, Sender},
+    task::JoinHandle,
+};
+use ::tokio_stream::wrappers::ReceiverStream;
+use ::tokio_util::{
+    codec::BytesCodec,
+    sync::{CancellationToken, PollSendError, PollSender},
+    udp::UdpFramed,
+};
 
 pub struct KcpUdpStream {
     config: Arc<KcpConfig>,
@@ -13,19 +40,17 @@ impl KcpUdpStream {
         config: Arc<KcpConfig>,
         addr: A,
         backlog: usize,
-        token: Option<CancellationToken>,
     ) -> io::Result<Self> {
         let udp = UdpSocket::bind(addr).await?;
-        Self::socket_listen(config, udp, backlog, token)
+        Self::socket_listen(config, udp, backlog)
     }
 
     pub fn socket_listen(
         config: Arc<KcpConfig>,
         udp: UdpSocket,
         backlog: usize,
-        token: Option<CancellationToken>,
     ) -> io::Result<Self> {
-        let token = token.unwrap_or_else(CancellationToken::new);
+        let token = CancellationToken::new();
         let backlog = backlog.max(8);
         let (stream_tx, stream_rx) = channel(backlog);
         let (msg_tx, msg_rx) = channel(backlog);
@@ -379,71 +404,5 @@ impl Task {
             self.accept_task_count -= 1;
             let _ = task.await;
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_udp_stream() {
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace"))
-            .format_timestamp_micros()
-            .is_test(true)
-            .try_init()
-            .ok();
-
-        let config = Arc::new(KcpConfig {
-            nodelay: KcpNoDelayConfig::normal(),
-            session_key: rand::random(),
-            ..Default::default()
-        });
-
-        let server_addr = "127.0.0.1:4323";
-        let mut server = KcpUdpStream::listen(config.clone(), server_addr, 8, None)
-            .await
-            .unwrap();
-
-        let (s1, s2) = tokio::join!(
-            KcpUdpStream::connect(config.clone(), server_addr),
-            server.next(),
-        );
-
-        for _ in 0..5 {
-            //error!("start");
-            let (x, y) = tokio::join!(
-                KcpUdpStream::connect(config.clone(), server_addr),
-                server.next(),
-            );
-            //error!("before close");
-            x.unwrap().0.close().await.ok();
-            y.unwrap().0.close().await.ok();
-            //error!("after close");
-        }
-
-        let mut s1 = s1.unwrap().0;
-        let mut s2 = s2.unwrap().0;
-
-        s1.send(Bytes::from_static(b"12345")).await.unwrap();
-        println!("{:?}", s2.next().await);
-
-        let frame = Bytes::from(vec![0u8; 300000]);
-        let start = std::time::Instant::now();
-        let mut received = 0;
-        while start.elapsed() < Duration::from_secs(10) {
-            select! {
-                _ = s1.send(frame.clone()) => (),
-                Some(Ok(x)) = s2.next() => {
-                    //trace!("received {}", x.len());
-                    received += x.len();
-                }
-            }
-        }
-        error!("total received {}", received);
-
-        s1.close().await.unwrap();
-        s2.close().await.unwrap();
-        server.close().await.unwrap();
     }
 }
