@@ -30,7 +30,7 @@ async fn test_udp_stream() {
         server.next(),
     );
 
-    for _ in 0..5 {
+    for _ in 0..100 {
         //info!("start");
         let (x, y) = tokio::join!(
             KcpUdpStream::connect(config.clone(), server_addr),

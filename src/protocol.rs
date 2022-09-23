@@ -125,7 +125,7 @@ impl Kcp {
         if size > 0 {
             let mut buf = BytesMut::with_capacity(size);
             unsafe { buf.set_len(size) };
-            self.recv(&mut buf).ok();
+            let _ = self.recv(&mut buf);
             Some(buf.freeze())
         } else {
             None
