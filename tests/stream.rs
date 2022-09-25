@@ -33,7 +33,7 @@ async fn test_stream() {
 
     let config = Arc::new(KcpConfig {
         nodelay: KcpNoDelayConfig::fastest(),
-        session_key: rand::random(),
+        session_key: Bytes::copy_from_slice(&rand::random::<[u8; 16]>()),
         ..Default::default()
     });
 

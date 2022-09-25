@@ -1,7 +1,6 @@
-use crate::protocol::Kcp;
 pub use crate::stream::*;
 
-use ::bytes::Bytes;
+use ::bytes::{Bytes, BytesMut};
 use ::futures::{
     future::{poll_fn, ready},
     SinkExt, Stream, StreamExt,
@@ -145,16 +144,11 @@ impl Stream for KcpUdpStream {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-struct RxData {
-    conv: u32,
-    data: Bytes,
-}
-
 struct Session {
     conv: u32,
-    session_id: KcpSessionKey,
+    session_id: Bytes,
     peer_addr: SocketAddr,
-    sender: Sender<Bytes>,
+    sender: Sender<BytesMut>,
     token: CancellationToken,
     task: Option<JoinHandle<()>>,
 }
@@ -169,22 +163,13 @@ struct Task {
     backlog: usize,
     stream_tx: Sender<(KcpStream, SocketAddr)>,
     msg_tx: Sender<Message>,
-    data_tx: Sender<RxData>,
+    data_tx: Sender<Bytes>,
     token: CancellationToken,
 
-    rx_queue: VecDeque<(Bytes, SocketAddr)>,
+    rx_queue: VecDeque<(BytesMut, SocketAddr)>,
     conv_map: LinkedHashMap<u32, Session>,
-    sid_map: LinkedHashMap<KcpSessionKey, u32>,
+    sid_map: LinkedHashMap<Bytes, u32>,
     accept_task_count: usize,
-}
-
-macro_rules! tri {
-    ($value:expr) => {
-        match $value {
-            Some(x) => x,
-            _ => break,
-        }
-    };
 }
 
 impl Task {
@@ -196,7 +181,7 @@ impl Task {
         backlog: usize,
         stream_tx: Sender<(KcpStream, SocketAddr)>,
         msg_tx: Sender<Message>,
-        data_tx: Sender<RxData>,
+        data_tx: Sender<Bytes>,
         token: CancellationToken,
     ) -> Self {
         Self {
@@ -217,7 +202,7 @@ impl Task {
         mut self,
         udp: UdpSocket,
         mut msg_rx: Receiver<Message>,
-        mut data_rx: Receiver<RxData>,
+        mut data_rx: Receiver<Bytes>,
     ) {
         let (mut udp_sink, mut udp_stream) = UdpFramed::new(udp, BytesCodec::new()).split();
         let token = self.token.clone();
@@ -225,16 +210,16 @@ impl Task {
         loop {
             select! {
                 Some(x) = udp_stream.next(), if self.rx_queue.is_empty() => {
-                    if let Ok((data, addr)) = x {
-                        self.rx_queue.push_back((data.into(), addr));
+                    if let Ok(x) = x {
+                        self.rx_queue.push_back(x);
                     }
                     // Try to receive more.
                     poll_fn(|cx| {
                         for _ in 0..self.rx_queue.capacity() - self.rx_queue.len() {
                             match udp_stream.poll_next_unpin(cx) {
                                 Poll::Ready(Some(x)) => {
-                                    if let Ok((data, addr)) = x {
-                                        self.rx_queue.push_back((data.into(), addr));
+                                    if let Ok(x) = x {
+                                        self.rx_queue.push_back(x);
                                     }
                                 }
                                 _ => break,
@@ -269,14 +254,16 @@ impl Task {
                     }
                 }
 
-                Some(RxData { conv, data }) = data_rx.recv() => {
-                    if let Some(session) = self.conv_map.get(&conv) {
+                Some(data) = data_rx.recv() => {
+                    if let Some(session) = KcpStream::read_conv(&data)
+                        .and_then(|conv|self.conv_map.get(&conv)) {
                         let _ = udp_sink.feed((data, session.peer_addr)).await;
                     }
                     // Try send more.
                     for _ in 0..Self::DATA_QUEUE_LOOP {
                         match data_rx.try_recv() {
-                            Ok(RxData { conv, data }) => if let Some(session) = self.conv_map.get(&conv) {
+                            Ok(data) => if let Some(session) = KcpStream::read_conv(&data)
+                                .and_then(|conv|self.conv_map.get(&conv)) {
                                 let _ = udp_sink.feed((data, session.peer_addr)).await;
                             },
                             _ => break,
@@ -302,77 +289,87 @@ impl Task {
     async fn recv_packet(&mut self) {
         while let Some((packet, peer_addr)) = self.rx_queue.front() {
             #[allow(clippy::never_loop)]
-            while let Some(pkt_conv) = Kcp::read_conv(packet) {
-                let mut session = self.conv_map.get(&pkt_conv);
-                if session.is_none() {
-                    // Try to accept a new connection.
-                    let session_id = tri!(tri!(Kcp::read_payload_data(packet))
-                        .strip_prefix(&self.config.session_key)
-                        .and_then(|x| KcpSessionKey::try_from(x).ok()));
-
-                    let conv = if let Some(&conv) = self.sid_map.get(&session_id) {
-                        if conv != pkt_conv && pkt_conv != KcpStream::SYN_CONV {
-                            // conv is inconsistent.
-                            break;
-                        }
-                        conv
-                    } else {
-                        if pkt_conv != KcpStream::SYN_CONV {
-                            // It's not a SYN handshake packet.
-                            break;
-                        }
-                        if self.stream_tx.try_reserve().is_err()
-                            || self.accept_task_count >= self.backlog
-                        {
-                            // TODO: No space to store a new connection.
-                            break;
-                        }
-
-                        // TODO: new conv
-                        let conv = loop {
-                            let x = KcpStream::rand_conv();
-                            if !self.conv_map.contains_key(&x) {
-                                break x;
-                            }
-                        };
-
-                        let (sender, receiver) = channel(self.config.snd_wnd as usize);
-                        let token = self.token.child_token();
-
-                        self.sid_map.insert(session_id, conv);
-                        self.conv_map.insert(
-                            conv,
-                            Session {
-                                conv,
-                                session_id,
-                                peer_addr: *peer_addr,
-                                sender,
-                                token: token.clone(),
-                                task: Some(tokio::spawn(Self::accept_stream(
-                                    self.config.clone(),
-                                    conv,
-                                    receiver,
-                                    self.data_tx.clone(),
-                                    self.msg_tx.clone(),
-                                    token,
-                                ))),
-                            },
-                        );
-                        self.accept_task_count += 1;
-                        conv
-                    };
-                    session = self.conv_map.get(&conv);
+            let session = loop {
+                // Find session by conv.
+                let pkt_conv = match KcpStream::read_conv(packet) {
+                    Some(x) => x,
+                    _ => break None,
+                };
+                if let x @ Some(_) = self.conv_map.get(&pkt_conv) {
+                    break x;
                 }
 
-                if let Some(session) = session {
-                    if &session.peer_addr == peer_addr {
-                        let _ = session.sender.send(packet.clone()).await;
+                // Try to accept a new connection.
+                let session_id = match KcpStream::read_session_id(packet, &self.config.session_key)
+                {
+                    Some(x) => x,
+                    _ => break None,
+                };
+
+                let conv = if let Some(&conv) = self.sid_map.get(session_id) {
+                    if conv != pkt_conv && pkt_conv != KcpStream::SYN_CONV {
+                        // conv is inconsistent.
+                        break None;
                     }
-                }
-                break;
-            }
+                    conv
+                } else {
+                    if pkt_conv != KcpStream::SYN_CONV
+                        || session_id.len() != self.config.session_id_len
+                    {
+                        // It's not a SYN handshake packet.
+                        break None;
+                    }
+                    if self.stream_tx.try_reserve().is_err()
+                        || self.accept_task_count >= self.backlog
+                    {
+                        // TODO: No space to store a new connection.
+                        break None;
+                    }
+
+                    // TODO: new conv
+                    let conv = loop {
+                        let x = KcpStream::rand_conv();
+                        if !self.conv_map.contains_key(&x) {
+                            break x;
+                        }
+                    };
+
+                    let (sender, receiver) = channel(self.config.snd_wnd as usize);
+                    let token = self.token.child_token();
+
+                    let session_id = Bytes::copy_from_slice(session_id);
+                    self.sid_map.insert(session_id.clone(), conv);
+                    self.conv_map.insert(
+                        conv,
+                        Session {
+                            conv,
+                            session_id,
+                            peer_addr: *peer_addr,
+                            sender,
+                            token: token.clone(),
+                            task: Some(tokio::spawn(Self::accept_stream(
+                                self.config.clone(),
+                                conv,
+                                receiver,
+                                self.data_tx.clone(),
+                                self.msg_tx.clone(),
+                                token,
+                            ))),
+                        },
+                    );
+                    self.accept_task_count += 1;
+                    conv
+                };
+                break self.conv_map.get(&conv);
+            };
 
             // Remove the packet.
+            if let Some(session) = session {
+                if &session.peer_addr == peer_addr {
+                    let _ = session.sender.send(packet.clone()).await;
+                }
+            }
+
             self.rx_queue.pop_front();
         }
     }
@@ -380,13 +377,12 @@ impl Task {
     async fn accept_stream(
         config: Arc<KcpConfig>,
         conv: u32,
-        receiver: Receiver<Bytes>,
-        data_tx: Sender<RxData>,
+        receiver: Receiver<BytesMut>,
+        data_tx: Sender<Bytes>,
         msg_tx: Sender<Message>,
         token: CancellationToken,
     ) {
-        let sink = PollSender::new(data_tx)
-            .with(move |x: Bytes| ready(Ok::<_, PollSendError<_>>(RxData { conv, data: x })));
+        let sink = PollSender::new(data_tx);
         let disconnect = PollSender::new(msg_tx.clone())
             .with(move |conv: u32| ready(Ok::<_, PollSendError<_>>(Message::Disconnect { conv })));
         let stream = ReceiverStream::new(receiver);

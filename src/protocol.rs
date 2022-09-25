@@ -1,4 +1,4 @@
-use ::bytes::{Bytes, BytesMut};
+use ::bytes::{BufMut, Bytes, BytesMut};
 use ::std::{
     collections::VecDeque,
     ffi::CStr,
@@ -16,7 +16,10 @@ pub use ffi::*;
 pub struct Kcp {
     handle: usize,
     time_base: Instant,
-    output_queue: VecDeque<Bytes>,
+    buffer_size: (usize, usize),
+    write_buf: BytesMut,
+    read_buf: BytesMut,
+    output_queue: VecDeque<BytesMut>,
 }
 
 impl Drop for Kcp {
@@ -57,6 +60,9 @@ impl Kcp {
         Self {
             handle: unsafe { ikcp_create(conv, null_mut()) as *const _ as usize },
             time_base: Instant::now(),
+            buffer_size: (32768, 32768),
+            write_buf: BytesMut::new(),
+            read_buf: BytesMut::new(),
             output_queue: VecDeque::with_capacity(32),
         }
     }
@@ -86,12 +92,14 @@ impl Kcp {
             user: *mut c_void,
         ) -> c_int {
             let this = &mut *(user as *const _ as *mut Kcp);
-            this.output_queue
-                .push_back(Bytes::copy_from_slice(slice::from_raw_parts(
-                    buf as _,
-                    len as usize,
-                )));
-            len
+            let size = len as usize;
+            if this.write_buf.capacity() < size {
+                this.write_buf.reserve(this.buffer_size.0.max(size));
+            }
+            this.write_buf
+                .put_slice(slice::from_raw_parts(buf as _, size));
+            this.output_queue.push_back(this.write_buf.split_to(size));
+            size as c_int
         }
 
         self.as_mut().user = self as *const _ as _;
@@ -123,8 +131,11 @@ impl Kcp {
     pub fn recv_bytes(&mut self) -> Option<Bytes> {
         let size = self.peek_size();
         if size > 0 {
-            let mut buf = BytesMut::with_capacity(size);
-            unsafe { buf.set_len(size) };
+            if self.read_buf.capacity() < size {
+                self.read_buf.reserve(self.buffer_size.1.max(size));
+            }
+            unsafe { self.read_buf.set_len(size) };
+            let mut buf = self.read_buf.split_to(size);
             let _ = self.recv(&mut buf);
             Some(buf.freeze())
         } else {
@@ -249,7 +260,7 @@ impl Kcp {
     }
 
     #[inline]
-    pub fn pop_output(&mut self) -> Option<Bytes> {
+    pub fn pop_output(&mut self) -> Option<BytesMut> {
         self.output_queue.pop_front()
     }
 

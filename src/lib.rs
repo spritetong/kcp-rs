@@ -3,7 +3,7 @@
 pub mod config;
 pub mod protocol;
 
-pub use crate::config::{KcpConfig, KcpNoDelayConfig, KcpSessionKey};
+pub use crate::config::{KcpConfig, KcpNoDelayConfig};
 
 #[cfg(feature = "stream")]
 pub mod stream;

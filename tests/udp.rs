@@ -16,7 +16,7 @@ async fn test_udp_stream() {
 
     let config = Arc::new(KcpConfig {
         nodelay: KcpNoDelayConfig::fastest(),
-        session_key: rand::random(),
+        session_key: Bytes::copy_from_slice(&rand::random::<[u8; 16]>()),
         ..Default::default()
     });
 
@@ -31,15 +31,12 @@ async fn test_udp_stream() {
     );
 
     for _ in 0..100 {
-        //info!("start");
         let (x, y) = tokio::join!(
             KcpUdpStream::connect(config.clone(), server_addr),
             server.next(),
         );
-        //info!("before close");
         x.unwrap().0.close().await.ok();
         y.unwrap().0.close().await.ok();
-        //info!("after close");
     }
 
     let mut s1 = s1.unwrap().0;

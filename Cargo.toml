@@ -23,7 +23,6 @@ rand = "0.8"
 tokio = { version = "1", features = ["net", "sync", "rt", "macros", "time"], optional = true }
 tokio-stream = { version = "0.1", features = ["sync"], optional = true }
 tokio-util = { version = "0.7", features = ["codec", "io", "net"], optional = true }
-zerocopy = "0.6"
 
 [dev-dependencies]
 env_logger = "0.9"

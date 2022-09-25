@@ -1,5 +1,6 @@
 // ! This file is referenced from https://github.com/Matrix-Zhang/tokio_kcp
 
+use ::bytes::Bytes;
 use ::std::time::Duration;
 
 #[derive(Debug, Clone, Copy)]
@@ -57,11 +58,8 @@ impl KcpNoDelayConfig {
     }
 }
 
-/// Type of session key, 16 bytes
-pub type KcpSessionKey = [u8; 16];
-
 /// Kcp Config
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct KcpConfig {
     /// Max Transmission Unit
     pub mtu: u32,
@@ -76,7 +74,9 @@ pub struct KcpConfig {
     /// Connect timeout, default is 15 seconds
     pub connect_timeout: Duration,
     /// Session key
-    pub session_key: KcpSessionKey,
+    pub session_key: Bytes,
+    /// Length of session ID
+    pub session_id_len: usize,
     /// Session expire duration, default is 90 seconds
     pub session_expire: Duration,
 }
@@ -90,8 +90,17 @@ impl Default for KcpConfig {
             rcv_wnd: 256,
             stream: true,
             connect_timeout: Duration::from_secs(15),
-            session_key: [0; 16],
+            session_key: Bytes::new(),
+            session_id_len: 16,
             session_expire: Duration::from_secs(90),
         }
+    }
+}
+
+impl KcpConfig {
+    pub fn random_session_id(&self) -> Vec<u8> {
+        std::iter::repeat_with(|| rand::random::<u8>())
+            .take(self.session_id_len)
+            .collect()        
     }
 }

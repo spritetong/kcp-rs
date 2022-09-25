@@ -7,6 +7,7 @@ use ::log::{error, trace, warn};
 use ::std::{
     fmt::Display,
     io,
+    marker::PhantomData,
     ops::Deref,
     pin::Pin,
     sync::Arc,
@@ -20,7 +21,6 @@ use ::tokio::{
     task::JoinHandle,
 };
 use ::tokio_util::sync::{CancellationToken, PollSender};
-use ::zerocopy::{AsBytes, FromBytes};
 
 pub struct KcpStream {
     config: Arc<KcpConfig>,
@@ -47,49 +47,32 @@ enum Message {
 }
 
 impl KcpStream {
-    pub const SYN_CONV: u32 = 0xFFFF_FFFE;
-
-    pub(crate) fn new<S, R, D>(
-        config: Arc<KcpConfig>,
-        conv: u32,
-        sink: S,
-        stream: R,
-        disconnect: D,
-        token: Option<CancellationToken>,
-    ) -> Self
-    where
-        S: Sink<Bytes> + Send + Unpin + 'static,
-        S::Error: Display,
-        R: Stream + Send + Unpin + 'static,
-        R::Item: Into<Bytes> + Send + 'static,
-        D: Sink<u32> + Send + Unpin + 'static,
-    {
-        let token = token.unwrap_or_else(CancellationToken::new);
-        let (msg_tx, msg_rx) = channel(config.snd_wnd.max(8) as usize);
-        let (data_tx, data_rx) = channel(config.rcv_wnd.max(16) as usize);
-
-        let task = Task::new(
-            config.clone(),
-            conv,
-            sink,
-            stream,
-            disconnect,
-            msg_rx,
-            data_tx,
-            token.clone(),
-        );
-        Self {
-            config,
-            conv: 0,
-            msg_sink: PollSender::new(msg_tx),
-            data_rx,
-            token,
-            task: Some(tokio::spawn(task.run())),
-            read_buf: None,
+    /// Generate a random conv.
+    pub fn rand_conv() -> u32 {
+        loop {
+            let conv = rand::random();
+            if conv != 0 && conv != Self::SYN_CONV {
+                break conv;
+            }
         }
     }
 
-    pub async fn connect<S, R, D>(
+    #[inline]
+    pub fn read_conv(packet: &[u8]) -> Option<u32> {
+        Kcp::read_conv(packet)
+    }
+
+    /// Read the session id from the SYN handshake packet.
+    #[inline]
+    pub fn read_session_id<'a>(packet: &'a [u8], session_key: &[u8]) -> Option<&'a [u8]> {
+        Kcp::read_payload_data(packet).and_then(|x| x.strip_prefix(session_key))
+    }
+}
+
+impl KcpStream {
+    pub const SYN_CONV: u32 = 0xFFFF_FFFE;
+
+    pub async fn connect<S, Si, R, D>(
         config: Arc<KcpConfig>,
         sink: S,
         stream: R,
@@ -97,10 +80,10 @@ impl KcpStream {
         token: Option<CancellationToken>,
     ) -> io::Result<Self>
     where
-        S: Sink<Bytes> + Send + Unpin + 'static,
+        S: Sink<Si> + Send + Unpin + 'static,
         S::Error: Display,
-        R: Stream + Send + Unpin + 'static,
-        R::Item: Into<Bytes> + Send + 'static,
+        Si: From<BytesMut> + Send + 'static,
+        R: Stream<Item = BytesMut> + Send + Unpin + 'static,
         D: Sink<u32> + Send + Unpin + 'static,
     {
         Self::new(
@@ -115,7 +98,7 @@ impl KcpStream {
         .await
     }
 
-    pub async fn accept<S, R, D>(
+    pub async fn accept<S, Si, R, D>(
         config: Arc<KcpConfig>,
         conv: u32,
         sink: S,
@@ -124,10 +107,10 @@ impl KcpStream {
         token: Option<CancellationToken>,
     ) -> io::Result<Self>
     where
-        S: Sink<Bytes> + Send + Unpin + 'static,
+        S: Sink<Si> + Send + Unpin + 'static,
         S::Error: Display,
-        R: Stream + Send + Unpin + 'static,
-        R::Item: Into<Bytes> + Send + 'static,
+        Si: From<BytesMut> + Send + 'static,
+        R: Stream<Item = BytesMut> + Send + Unpin + 'static,
         D: Sink<u32> + Send + Unpin + 'static,
     {
         if conv == 0 || conv == Self::SYN_CONV {
@@ -137,6 +120,54 @@ impl KcpStream {
         Self::new(config.clone(), conv, sink, stream, disconnect, token)
             .wait_connection()
             .await
+    }
+
+    fn new<S, Si, R, D>(
+        config: Arc<KcpConfig>,
+        conv: u32,
+        sink: S,
+        stream: R,
+        disconnect: D,
+        token: Option<CancellationToken>,
+    ) -> Self
+    where
+        S: Sink<Si> + Send + Unpin + 'static,
+        S::Error: Display,
+        Si: From<BytesMut> + Send + 'static,
+        R: Stream<Item = BytesMut> + Send + Unpin + 'static,
+        D: Sink<u32> + Send + Unpin + 'static,
+    {
+        let token = token.unwrap_or_else(CancellationToken::new);
+        let (msg_tx, msg_rx) = channel(config.snd_wnd.max(8) as usize);
+        let (data_tx, data_rx) = channel(config.rcv_wnd.max(16) as usize);
+
+        Self {
+            config: config.clone(),
+            conv: 0,
+            msg_sink: PollSender::new(msg_tx),
+            data_rx,
+            token: token.clone(),
+            task: Some(tokio::spawn(
+                Task {
+                    kcp: Kcp::new(conv),
+                    config,
+                    sink,
+                    stream,
+                    disconnect,
+                    msg_rx,
+                    data_tx,
+                    token,
+                    rx_buf: BytesMut::new(),
+                    tx_frame: None,
+                    states: Task::<S, Si, R, D>::SYN_HANDSHAKE,
+                    last_io_time: 0,
+                    session_id: Default::default(),
+                    _phantom: Default::default(),
+                }
+                .run(),
+            )),
+            read_buf: None,
+        }
     }
 
     #[inline]
@@ -154,16 +185,6 @@ impl KcpStream {
             .send(Message::Flush)
             .await
             .map_err(|_| io::Error::from(io::ErrorKind::NotConnected))
-    }
-
-    /// Generate a random conv.
-    pub fn rand_conv() -> u32 {
-        loop {
-            let conv = rand::random();
-            if conv != 0 && conv != Self::SYN_CONV {
-                break conv;
-            }
-        }
     }
 
     async fn wait_connection(mut self) -> io::Result<Self> {
@@ -199,14 +220,7 @@ impl Drop for KcpStream {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-#[derive(Clone, Copy, Default, AsBytes, FromBytes)]
-#[repr(C)]
-struct SynData {
-    key: KcpSessionKey,
-    id: KcpSessionKey,
-}
-
-struct Task<S, R, D> {
+struct Task<S, Si, R, D> {
     kcp: Kcp,
     config: Arc<KcpConfig>,
     sink: S,
@@ -220,10 +234,11 @@ struct Task<S, R, D> {
 
     states: u32,
     last_io_time: u32,
-    session_id: KcpSessionKey,
+    session_id: Vec<u8>,
+    _phantom: PhantomData<Si>,
 }
 
-impl<S, R, D> Task<S, R, D> {
+impl<S, Si, R, D> Task<S, Si, R, D> {
     const RESET: u32 = 0x04;
     const CLOSED: u32 = 0x08;
 
@@ -239,43 +254,14 @@ impl<S, R, D> Task<S, R, D> {
     const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 }
 
-impl<S, R, D> Task<S, R, D>
+impl<S, Si, R, D> Task<S, Si, R, D>
 where
-    S: Sink<Bytes> + Unpin,
+    S: Sink<Si> + Unpin,
     S::Error: Display,
-    R: Stream + Unpin,
-    R::Item: Into<Bytes>,
+    Si: From<BytesMut> + Send,
+    R: Stream<Item = BytesMut> + Unpin,
     D: Sink<u32> + Send + Unpin,
 {
-    fn new(
-        config: Arc<KcpConfig>,
-        conv: u32,
-        sink: S,
-        stream: R,
-        disconnect: D,
-        msg_rx: Receiver<Message>,
-        data_tx: Sender<Data>,
-        token: CancellationToken,
-    ) -> Self {
-        let mut kcp = Kcp::new(0);
-        kcp.set_conv(conv);
-        Self {
-            kcp,
-            config,
-            sink,
-            stream,
-            disconnect,
-            msg_rx,
-            data_tx,
-            token,
-            rx_buf: BytesMut::new(),
-            tx_frame: None,
-            states: Self::SYN_HANDSHAKE,
-            last_io_time: 0,
-            session_id: Default::default(),
-        }
-    }
-
     async fn run(mut self) {
         self.kcp.initialize();
         self.kcp_apply_config();
@@ -285,8 +271,8 @@ where
         self.last_io_time = self.kcp.current();
         if self.kcp.conv() == KcpStream::SYN_CONV {
             self.states |= Self::CLIENT;
-            // Create random session ID for client.
-            self.session_id = rand::random();
+            // Create random session ID for handshake.
+            self.session_id = self.config.random_session_id();
             // Send SYN packet.
             self.kcp.set_conv(KcpStream::SYN_CONV);
             self.syn_handshake_send();
@@ -373,7 +359,7 @@ where
                             }).await;
 
                             // SYN handshake.
-                            if self.test_state(Self::SYN_HANDSHAKE) && self.syn_handshake_recv().is_err(){
+                            if self.in_state(Self::SYN_HANDSHAKE) && self.syn_handshake_recv().is_err(){
                                 self.data_tx.send(Data::Disconnect(io::ErrorKind::NotConnected)).await.ok();
                                 break;
                             }
@@ -412,21 +398,20 @@ where
     }
 
     #[inline]
-    fn test_state(&self, state: u32) -> bool {
+    fn in_state(&self, state: u32) -> bool {
         self.states & state != 0
     }
 
     fn syn_handshake_send(&mut self) {
         self.states |= Self::FLUSH;
-        self.kcp
-            .send(
-                SynData {
-                    key: self.config.session_key,
-                    id: self.session_id,
-                }
-                .as_bytes(),
-            )
-            .unwrap();
+        let syn: Vec<u8> = self
+            .config
+            .session_key
+            .iter()
+            .chain(self.session_id.iter())
+            .map(|&x| x)
+            .collect();
+        self.kcp.send(syn.as_slice()).unwrap();
         self.kcp_flush();
     }
 
@@ -436,31 +421,39 @@ where
             Some(x) => x,
             _ => return Ok(()),
         };
-        // Only receive SYN frame for the server endpoint.
-        if let Some(syn) = SynData::read_from(data.deref()) {
-            // Key must be consistent.
-            if self.config.session_key == syn.key {
-                if self.test_state(Self::CLIENT) {
-                    // Verify the session ID for the client endpoint.
-                    if self.session_id != syn.id {
-                        return Err(());
-                    }
-                    self.kcp_apply_nodelay();
+        // Check the session key and get the session ID.
+        if let Some(session_id) = data
+            .deref()
+            .strip_prefix(self.config.session_key.deref())
+            .and_then(|x| {
+                if x.len() == self.config.session_id_len {
+                    Some(x)
                 } else {
-                    self.session_id = syn.id;
-                    self.kcp_apply_nodelay();
-                    self.syn_handshake_send();
+                    None
                 }
-
-                // Connection has been established.
-                self.states &= !Self::SYN_HANDSHAKE;
-                self.data_tx
-                    .try_send(Data::Connected {
-                        conv: self.kcp.conv(),
-                    })
-                    .ok();
-                return Ok(());
+            })
+        {
+            // Key must be consistent.
+            if self.in_state(Self::CLIENT) {
+                // Verify the session ID for the client endpoint.
+                if self.session_id != session_id {
+                    return Err(());
+                }
+                self.kcp_apply_nodelay();
+            } else {
+                self.session_id = session_id.to_vec();
+                self.kcp_apply_nodelay();
+                self.syn_handshake_send();
             }
+
+            // Connection has been established.
+            self.states &= !Self::SYN_HANDSHAKE;
+            self.data_tx
+                .try_send(Data::Connected {
+                    conv: self.kcp.conv(),
+                })
+                .ok();
+            return Ok(());
         }
         Err(())
     }
@@ -468,8 +461,8 @@ where
     fn syn_handshake_input(&mut self, data: Bytes) -> io::Result<()> {
         // Switch kcp's conv to try to accept the data packet.
         if let Some(conv) = Kcp::read_conv(data.deref()) {
-            if self.test_state(Self::CLIENT) {
-                if self.test_state(Self::SYN_HANDSHAKE) && conv != KcpStream::SYN_CONV {
+            if self.in_state(Self::CLIENT) {
+                if self.in_state(Self::SYN_HANDSHAKE) && conv != KcpStream::SYN_CONV {
                     // For the client endpoint.
                     // Try to accept conv from the server.
                     self.kcp.set_conv(conv);
@@ -545,7 +538,7 @@ where
     }
 
     fn kcp_flush(&mut self) {
-        if self.test_state(Self::FLUSH) {
+        if self.in_state(Self::FLUSH) {
             self.states ^= Self::FLUSH;
             self.kcp.update(self.kcp.get_system_time());
             self.kcp.flush();
@@ -587,7 +580,7 @@ where
 
     async fn kcp_output(kcp: &mut Kcp, sink: &mut S) {
         while let Some(data) = kcp.pop_output() {
-            if let Err(e) = sink.feed(data).await {
+            if let Err(e) = sink.feed(data.into()).await {
                 // clear all output buffers on error
                 while kcp.pop_output().is_some() {}
                 warn!("send to sink: {}", e);
