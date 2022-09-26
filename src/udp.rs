@@ -1,4 +1,5 @@
 pub use crate::stream::*;
+use crate::transport::*;
 
 use ::bytes::{Bytes, BytesMut};
 use ::futures::{
@@ -20,7 +21,6 @@ use ::tokio::{
     sync::mpsc::{channel, Receiver, Sender},
     task::JoinHandle,
 };
-use ::tokio_stream::wrappers::ReceiverStream;
 use ::tokio_util::{
     codec::BytesCodec,
     sync::{CancellationToken, PollSendError, PollSender},
@@ -117,13 +117,14 @@ impl KcpUdpStream {
             .next()
             .ok_or(io::ErrorKind::AddrNotAvailable)?;
 
-        let (sink, stream) = UdpFramed::new(udp, BytesCodec::new()).split();
-        let sink = sink.with(move |x: Bytes| ready(io::Result::Ok((x, addr))));
-        let stream = stream.filter_map(|x| ready(x.ok().map(|(x, _)| x)));
-
-        KcpStream::connect(config, sink, stream, futures::sink::drain(), None)
-            .await
-            .map(|x| (x, addr))
+        KcpStream::connect(
+            config,
+            KcpUdpTransport::new(udp, addr),
+            futures::sink::drain(),
+            None,
+        )
+        .await
+        .map(|x| (x, addr))
     }
 }
 
@@ -382,12 +383,16 @@ impl Task {
         msg_tx: Sender<Message>,
         token: CancellationToken,
     ) {
-        let sink = PollSender::new(data_tx);
         let disconnect = PollSender::new(msg_tx.clone())
             .with(move |conv: u32| ready(Ok::<_, PollSendError<_>>(Message::Disconnect { conv })));
-        let stream = ReceiverStream::new(receiver);
-        if let Ok(stream) =
-            KcpStream::accept(config, conv, sink, stream, disconnect, Some(token)).await
+        if let Ok(stream) = KcpStream::accept(
+            config,
+            conv,
+            KcpChannelTransport::new(data_tx, receiver),
+            disconnect,
+            Some(token),
+        )
+        .await
         {
             let _ = msg_tx.send(Message::Connect(stream)).await;
         }

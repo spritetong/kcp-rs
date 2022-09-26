@@ -72,69 +72,56 @@ impl KcpStream {
 impl KcpStream {
     pub const SYN_CONV: u32 = 0xFFFF_FFFE;
 
-    pub async fn connect<S, Si, R, D>(
+    pub async fn connect<T, Si, D>(
         config: Arc<KcpConfig>,
-        sink: S,
-        stream: R,
+        transport: T,
         disconnect: D,
         token: Option<CancellationToken>,
     ) -> io::Result<Self>
     where
-        S: Sink<Si> + Send + Unpin + 'static,
-        S::Error: Display,
+        T: Sink<Si> + Stream<Item = BytesMut> + Send + Unpin + 'static,
         Si: From<BytesMut> + Send + 'static,
-        R: Stream<Item = BytesMut> + Send + Unpin + 'static,
+        <T as Sink<Si>>::Error: Display,
         D: Sink<u32> + Send + Unpin + 'static,
     {
-        Self::new(
-            config.clone(),
-            Self::SYN_CONV,
-            sink,
-            stream,
-            disconnect,
-            token,
-        )
-        .wait_connection()
-        .await
+        Self::new(config.clone(), Self::SYN_CONV, transport, disconnect, token)
+            .wait_connection()
+            .await
     }
 
-    pub async fn accept<S, Si, R, D>(
+    pub async fn accept<T, Si, D>(
         config: Arc<KcpConfig>,
         conv: u32,
-        sink: S,
-        stream: R,
+        transport: T,
         disconnect: D,
         token: Option<CancellationToken>,
     ) -> io::Result<Self>
     where
-        S: Sink<Si> + Send + Unpin + 'static,
-        S::Error: Display,
+        T: Sink<Si> + Stream<Item = BytesMut> + Send + Unpin + 'static,
         Si: From<BytesMut> + Send + 'static,
-        R: Stream<Item = BytesMut> + Send + Unpin + 'static,
+        <T as Sink<Si>>::Error: Display,
         D: Sink<u32> + Send + Unpin + 'static,
     {
         if conv == 0 || conv == Self::SYN_CONV {
             error!("Invalid conv 0x{:08X}", Self::SYN_CONV);
             return Err(io::ErrorKind::InvalidInput.into());
         }
-        Self::new(config.clone(), conv, sink, stream, disconnect, token)
+        Self::new(config.clone(), conv, transport, disconnect, token)
             .wait_connection()
             .await
     }
 
-    fn new<S, Si, R, D>(
+    fn new<T, Si, D>(
         config: Arc<KcpConfig>,
         conv: u32,
-        sink: S,
-        stream: R,
+        transport: T,
         disconnect: D,
         token: Option<CancellationToken>,
     ) -> Self
     where
-        S: Sink<Si> + Send + Unpin + 'static,
-        S::Error: Display,
+        T: Sink<Si> + Stream<Item = BytesMut> + Send + Unpin + 'static,
         Si: From<BytesMut> + Send + 'static,
-        R: Stream<Item = BytesMut> + Send + Unpin + 'static,
+        <T as Sink<Si>>::Error: Display,
         D: Sink<u32> + Send + Unpin + 'static,
     {
         let token = token.unwrap_or_else(CancellationToken::new);
@@ -151,15 +138,14 @@ impl KcpStream {
                 Task {
                     kcp: Kcp::new(conv),
                     config,
-                    sink,
-                    stream,
+                    transport,
                     disconnect,
                     msg_rx,
                     data_tx,
                     token,
                     rx_buf: BytesMut::new(),
                     tx_frame: None,
-                    states: Task::<S, Si, R, D>::SYN_HANDSHAKE,
+                    states: Task::<T, Si, D>::SYN_HANDSHAKE,
                     last_io_time: 0,
                     session_id: Default::default(),
                     _phantom: Default::default(),
@@ -220,11 +206,10 @@ impl Drop for KcpStream {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-struct Task<S, Si, R, D> {
+struct Task<T, Si, D> {
     kcp: Kcp,
     config: Arc<KcpConfig>,
-    sink: S,
-    stream: R,
+    transport: T,
     disconnect: D,
     msg_rx: Receiver<Message>,
     data_tx: Sender<Data>,
@@ -238,7 +223,7 @@ struct Task<S, Si, R, D> {
     _phantom: PhantomData<Si>,
 }
 
-impl<S, Si, R, D> Task<S, Si, R, D> {
+impl<T, Si, D> Task<T, Si, D> {
     const RESET: u32 = 0x04;
     const CLOSED: u32 = 0x08;
 
@@ -254,12 +239,11 @@ impl<S, Si, R, D> Task<S, Si, R, D> {
     const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 }
 
-impl<S, Si, R, D> Task<S, Si, R, D>
+impl<T, Si, D> Task<T, Si, D>
 where
-    S: Sink<Si> + Unpin,
-    S::Error: Display,
+    T: Sink<Si> + Stream<Item = BytesMut> + Unpin,
     Si: From<BytesMut> + Send,
-    R: Stream<Item = BytesMut> + Unpin,
+    <T as Sink<Si>>::Error: Display,
     D: Sink<u32> + Send + Unpin,
 {
     async fn run(mut self) {
@@ -283,7 +267,7 @@ where
             if self.kcp.has_ouput() {
                 select! {
                     biased;
-                    _ = Self::kcp_output(&mut self.kcp, &mut self.sink) => (),
+                    _ = Self::kcp_output(&mut self.kcp, &mut self.transport) => (),
                     _ = self.token.cancelled() => break,
                 }
             }
@@ -343,14 +327,14 @@ where
                     }
                 }
 
-                x = self.stream.next() => {
+                x = self.transport.next() => {
                     match x {
                         Some(data) => {
                             self.kcp_input(data.into());
                             // Try to receive more.
                             poll_fn(|cx| {
                                 for _ in 1..self.config.rcv_wnd {
-                                    match self.stream.poll_next_unpin(cx) {
+                                    match self.transport.poll_next_unpin(cx) {
                                         Poll::Ready(Some(data)) => self.kcp_input(data.into()),
                                         _ => break,
                                     }
@@ -578,7 +562,7 @@ where
         }
     }
 
-    async fn kcp_output(kcp: &mut Kcp, sink: &mut S) {
+    async fn kcp_output(kcp: &mut Kcp, sink: &mut T) {
         while let Some(data) = kcp.pop_output() {
             if let Err(e) = sink.feed(data.into()).await {
                 // clear all output buffers on error

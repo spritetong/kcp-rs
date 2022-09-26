@@ -1,11 +1,11 @@
 use ::kcp::stream::*;
 
 use ::bytes::Bytes;
-use ::futures::{future::ready, SinkExt, StreamExt};
+use ::futures::{SinkExt, StreamExt};
 use ::log::info;
-use ::std::{io, net::SocketAddr, sync::Arc, time::Duration};
+use ::std::{net::SocketAddr, sync::Arc, time::Duration};
 use ::tokio::{net::UdpSocket, select};
-use ::tokio_util::{codec::BytesCodec, udp::UdpFramed};
+use kcp::transport::KcpUdpTransport;
 
 #[tokio::test]
 async fn test_stream() {
@@ -18,18 +18,21 @@ async fn test_stream() {
     let addr1: SocketAddr = "127.0.0.1:4321".parse().unwrap();
     let addr2: SocketAddr = "127.0.0.1:4322".parse().unwrap();
 
-    // Split Stream + Sink object into separate sink and stream.
-    let (sink, stream) =
-        UdpFramed::new(UdpSocket::bind(addr1).await.unwrap(), BytesCodec::new()).split();
-    let stream1 = stream.filter_map(|x| ready(x.ok().map(|(x, _)| x)));
-    let sink1 = sink.with(move |x: Bytes| ready(io::Result::Ok((x, addr2))));
+    // // Split Stream + Sink object into separate sink and stream.
+    // let (sink, stream) =
+    //     UdpFramed::new(UdpSocket::bind(addr1).await.unwrap(), BytesCodec::new()).split();
+    // let stream1 = stream.filter_map(|x| ready(x.ok().map(|(x, _)| x)));
+    // let sink1 = sink.with(move |x: Bytes| ready(io::Result::Ok((x, addr2))));
 
-    // Create stream and sink independently.
-    let udp2 = Arc::new(UdpSocket::bind(addr2).await.unwrap());
-    let stream2 = UdpFramed::new(udp2.clone(), BytesCodec::new())
-        .filter_map(|x| ready(x.ok().map(|(x, _)| x)));
-    let sink2 = UdpFramed::new(udp2, BytesCodec::new())
-        .with(move |x: Bytes| ready(io::Result::Ok((x, addr1))));
+    // // Create stream and sink independently.
+    // let udp2 = Arc::new(UdpSocket::bind(addr2).await.unwrap());
+    // let stream2 = UdpFramed::new(udp2.clone(), BytesCodec::new())
+    //     .filter_map(|x| ready(x.ok().map(|(x, _)| x)));
+    // let sink2 = UdpFramed::new(udp2, BytesCodec::new())
+    //     .with(move |x: Bytes| ready(io::Result::Ok((x, addr1))));
+
+    let s1 = KcpUdpTransport::new(UdpSocket::bind(addr1).await.unwrap(), addr2);
+    let s2 = KcpUdpTransport::new(UdpSocket::bind(addr2).await.unwrap(), addr1);
 
     let config = Arc::new(KcpConfig {
         nodelay: KcpNoDelayConfig::fastest(),
@@ -41,12 +44,11 @@ async fn test_stream() {
         KcpStream::accept(
             config.clone(),
             KcpStream::rand_conv(),
-            sink1,
-            stream1,
+            s1,
             futures::sink::drain(),
             None,
         ),
-        KcpStream::connect(config, sink2, stream2, futures::sink::drain(), None),
+        KcpStream::connect(config, s2, futures::sink::drain(), None),
     );
     let mut s1 = Box::new(s1.unwrap());
     let mut s2 = Box::new(s2.unwrap());
