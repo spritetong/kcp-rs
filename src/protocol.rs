@@ -220,7 +220,7 @@ impl Kcp {
 
     ////////////////////////////////////////////////////////////////////////////
 
-    export_fields! { conv, current, nsnd_que }
+    export_fields! { conv, current, nsnd_que, nrcv_que, nrcv_buf }
 
     pub fn duration_since(&self, since: u32) -> u32 {
         (self.current().wrapping_sub(since) as i32).max(0) as u32

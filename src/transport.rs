@@ -1,27 +1,52 @@
 use ::futures::{Sink, SinkExt, Stream};
 use ::std::{
+    marker::PhantomData,
     pin::Pin,
     task::{Context, Poll},
 };
 use ::tokio::sync::mpsc::{Receiver, Sender};
-use ::tokio_util::sync::{PollSendError, PollSender};
+use ::tokio_util::sync::PollSender;
 
-pub struct TokioMpscTransport<S, R> {
+pub struct MpscTransport<S, R> {
     sink: PollSender<S>,
     stream: Receiver<R>,
 }
 
-impl<S: Send + 'static, R: Send + 'static> TokioMpscTransport<S, R> {
+impl<S, R> MpscTransport<S, R>
+where
+    S: Send + 'static,
+    R: Send,
+{
     pub fn new(sink: Sender<S>, stream: Receiver<R>) -> Self {
         Self {
             sink: PollSender::new(sink),
             stream,
         }
     }
+
+    pub fn get_sink(&self) -> &PollSender<S> {
+        &self.sink
+    }
+
+    pub fn get_sink_mut(&mut self) -> &mut PollSender<S> {
+        &mut self.sink
+    }
+
+    pub fn get_stream(&self) -> &Receiver<R> {
+        &self.stream
+    }
+
+    pub fn get_stream_mut(&mut self) -> &mut Receiver<R> {
+        &mut self.stream
+    }
 }
 
-impl<S: Send + 'static, R: Send + 'static> Sink<S> for TokioMpscTransport<S, R> {
-    type Error = PollSendError<S>;
+impl<S, R> Sink<S> for MpscTransport<S, R>
+where
+    S: Send + 'static,
+    R: Send,
+{
+    type Error = <PollSender<S> as Sink<S>>::Error;
 
     #[inline]
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -44,12 +69,97 @@ impl<S: Send + 'static, R: Send + 'static> Sink<S> for TokioMpscTransport<S, R> 
     }
 }
 
-impl<S: Send + 'static, R: Send + 'static> Stream for TokioMpscTransport<S, R> {
+impl<S, R> Stream for MpscTransport<S, R>
+where
+    S: Send + 'static,
+    R: Send,
+{
     type Item = R;
 
     #[inline]
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.stream.poll_recv(cx)
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+pub struct MergeTransport<S, Si, R> {
+    sink: S,
+    stream: R,
+    _phantom: PhantomData<Si>,
+}
+
+impl<S, Si, R> MergeTransport<S, Si, R> {
+    pub fn new(sink: S, stream: R) -> Self {
+        Self {
+            sink,
+            stream,
+            _phantom: Default::default(),
+        }
+    }
+
+    pub fn get_sink(&self) -> &S {
+        &self.sink
+    }
+
+    pub fn get_sink_mut(&mut self) -> &mut S {
+        &mut self.sink
+    }
+
+    pub fn get_stream(&self) -> &R {
+        &self.stream
+    }
+
+    pub fn get_stream_mut(&mut self) -> &mut R {
+        &mut self.stream
+    }
+
+    pub fn split_into(self) -> (S, R) {
+        (self.sink, self.stream)
+    }
+}
+
+impl<S, Si, R> Sink<Si> for MergeTransport<S, Si, R>
+where
+    S: Sink<Si> + Unpin,
+    Si: Send + Unpin,
+    R: Stream + Unpin,
+{
+    type Error = S::Error;
+
+    #[inline]
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.sink.poll_ready_unpin(cx)
+    }
+
+    #[inline]
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.sink.poll_flush_unpin(cx)
+    }
+
+    #[inline]
+    fn start_send(mut self: Pin<&mut Self>, item: Si) -> Result<(), Self::Error> {
+        self.sink.start_send_unpin(item)
+    }
+
+    #[inline]
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.sink.poll_close_unpin(cx)
+    }
+}
+
+impl<S, Si, R> Stream for MergeTransport<S, Si, R>
+where
+    S: Sink<Si> + Unpin,
+    Si: Send + Unpin,
+    R: Stream + Unpin,
+{
+    type Item = R::Item;
+
+    #[inline]
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.stream.poll_next_unpin(cx)
     }
 }
 

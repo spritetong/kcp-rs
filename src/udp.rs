@@ -388,7 +388,7 @@ impl Task {
         if let Ok(stream) = KcpStream::accept(
             config,
             conv,
-            TokioMpscTransport::new(data_tx, receiver),
+            MpscTransport::new(data_tx, receiver),
             disconnect,
             Some(token),
         )

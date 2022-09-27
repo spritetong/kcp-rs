@@ -46,8 +46,8 @@ async fn test_stream() {
         let (tx1, rx2) = tokio::sync::mpsc::channel::<BytesMut>(1024);
         let (tx2, rx1) = tokio::sync::mpsc::channel::<BytesMut>(1024);
         (
-            TokioMpscTransport::new(tx1, rx1),
-            TokioMpscTransport::new(tx2, rx2),
+            MpscTransport::new(tx1, rx1),
+            MpscTransport::new(tx2, rx2),
         )
     };
 

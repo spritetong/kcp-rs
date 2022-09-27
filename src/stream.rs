@@ -224,10 +224,12 @@ struct Task<T, Si, D> {
 }
 
 impl<T, Si, D> Task<T, Si, D> {
-    const RESET: u32 = 0x04;
-    const CLOSED: u32 = 0x08;
-
     const SYN_HANDSHAKE: u32 = 0x01;
+    const FIN_RECVED: u32 = 0x02;
+    const FIN_PENDING: u32 = 0x04;
+    const FIN_HANDSHAKE: u32 = 0x08;
+    const FIN_DISCONNECT: u32 = 0x10;
+    const DISCONNECTED: u32 = 0x20;
     const CLIENT: u32 = 0x40;
     const FLUSH: u32 = 0x80;
 
@@ -259,7 +261,7 @@ where
             self.session_id = self.config.random_session_id();
             // Send SYN packet.
             self.kcp.set_conv(KcpStream::SYN_CONV);
-            self.syn_handshake_send();
+            self.handshake_send();
         }
 
         let data_tx = self.data_tx.clone();
@@ -267,7 +269,7 @@ where
             if self.kcp.has_ouput() {
                 select! {
                     biased;
-                    _ = Self::kcp_output(&mut self.kcp, &mut self.transport) => (),
+                    _ = Self::kcp_output(&mut self.kcp, &mut self.transport, self.states) => (),
                     _ = self.token.cancelled() => break,
                 }
             }
@@ -312,7 +314,7 @@ where
                             if let Some(data) = self.tx_frame.take() {
                                 permit.send(Data::Frame(data));
                             }
-                            while let Some(data) = self.kcp.recv_bytes() {
+                            while let Some(data) = self.kcp_recv() {
                                 match data_tx.try_reserve() {
                                     Ok(permit) => permit.send(Data::Frame(data)),
                                     _ => {
@@ -330,12 +332,12 @@ where
                 x = self.transport.next() => {
                     match x {
                         Some(data) => {
-                            self.kcp_input(data.into());
+                            self.kcp_input(data);
                             // Try to receive more.
                             poll_fn(|cx| {
                                 for _ in 1..self.config.rcv_wnd {
                                     match self.transport.poll_next_unpin(cx) {
-                                        Poll::Ready(Some(data)) => self.kcp_input(data.into()),
+                                        Poll::Ready(Some(data)) => self.kcp_input(data),
                                         _ => break,
                                     }
                                 }
@@ -343,14 +345,15 @@ where
                             }).await;
 
                             // SYN handshake.
-                            if self.in_state(Self::SYN_HANDSHAKE) && self.syn_handshake_recv().is_err(){
-                                self.data_tx.send(Data::Disconnect(io::ErrorKind::NotConnected)).await.ok();
+                            if (self.in_state(Self::SYN_HANDSHAKE) && self.syn_handshake_recv().is_err()) ||
+                                self.in_state(Self::FIN_DISCONNECT) {
+                                self.send_disconnected().await;
                                 break;
                             }
 
                             // Try to fetch a frame.
                             if self.tx_frame.is_none() {
-                                self.tx_frame = self.kcp.recv_bytes();
+                                self.tx_frame = self.kcp_recv();
                             }
                             // Try to flush.
                             self.kcp_flush();
@@ -386,7 +389,19 @@ where
         self.states & state != 0
     }
 
-    fn syn_handshake_send(&mut self) {
+    async fn send_disconnected(&mut self) {
+        if !self.in_state(Self::DISCONNECTED) {
+            self.states |= Self::DISCONNECTED;
+            self.states &= !Self::FIN_DISCONNECT;
+            select! {
+                biased;
+                _ = self.data_tx.send(Data::Disconnect(io::ErrorKind::NotConnected)) => (),
+                _ = self.token.cancelled() => (),
+            }
+        }
+    }
+
+    fn handshake_send(&mut self) {
         self.states |= Self::FLUSH;
         let mut syn = Vec::<u8>::new();
         syn.put_slice(&self.config.session_key);
@@ -397,7 +412,7 @@ where
 
     fn syn_handshake_recv(&mut self) -> Result<(), ()> {
         // Check SYN data.
-        let data = match self.kcp.recv_bytes() {
+        let data = match self.kcp_recv() {
             Some(x) => x,
             _ => return Ok(()),
         };
@@ -423,7 +438,7 @@ where
             } else {
                 self.session_id = session_id.to_vec();
                 self.kcp_apply_nodelay();
-                self.syn_handshake_send();
+                self.handshake_send();
             }
 
             // Connection has been established.
@@ -438,15 +453,15 @@ where
         Err(())
     }
 
-    fn syn_handshake_input(&mut self, data: Bytes) -> io::Result<()> {
+    fn syn_handshake_input(&mut self, data: &[u8]) -> io::Result<()> {
         // Switch kcp's conv to try to accept the data packet.
-        if let Some(conv) = Kcp::read_conv(data.deref()) {
+        if let Some(conv) = Kcp::read_conv(data) {
             if self.in_state(Self::CLIENT) {
                 if self.in_state(Self::SYN_HANDSHAKE) && conv != KcpStream::SYN_CONV {
                     // For the client endpoint.
                     // Try to accept conv from the server.
                     self.kcp.set_conv(conv);
-                    if self.kcp.input(&data).is_err() || self.kcp.get_waitsnd() > 0 {
+                    if self.kcp.input(data).is_err() || self.kcp.get_waitsnd() > 0 {
                         // Restore conv if failed.
                         self.kcp.set_conv(KcpStream::SYN_CONV);
                     }
@@ -457,7 +472,7 @@ where
                 let mine = self.kcp.conv();
                 // Switch conv temporarily.
                 self.kcp.set_conv(conv);
-                self.kcp.input(&data).ok();
+                self.kcp.input(data).ok();
                 // Restore conv.
                 self.kcp.set_conv(mine);
                 return Ok(());
@@ -466,9 +481,30 @@ where
         Err(io::ErrorKind::InvalidInput.into())
     }
 
-    fn fin_handshake_input(&mut self, _data: Bytes) -> io::Result<()> {
-        // TODO:
-        Ok(())
+    fn fin_state_transite(&mut self) {
+        if self.in_state(Self::SYN_HANDSHAKE) {
+            self.states ^= Self::SYN_HANDSHAKE;
+            self.states |= Self::FIN_DISCONNECT;
+        } else {
+            if !self.in_state(Self::FIN_PENDING | Self::FIN_HANDSHAKE) {
+                self.states |= Self::FIN_PENDING;
+            }
+
+            if self.in_state(Self::FIN_PENDING) {
+                if self.kcp.get_waitsnd() == 0 {
+                    self.states ^= Self::FIN_PENDING;
+                    self.states |= Self::FIN_HANDSHAKE;
+                    self.handshake_send();
+                }
+            }
+
+            if self.in_state(Self::FIN_HANDSHAKE) {
+                if self.kcp.get_waitsnd() == 0 {
+                    self.states ^= Self::FIN_HANDSHAKE;
+                    self.states |= Self::FIN_DISCONNECT;
+                }
+            }
+        }
     }
 
     fn reset_connection(&self) {
@@ -517,6 +553,16 @@ where
         );
     }
 
+    fn kcp_recv(&mut self) -> Option<Bytes> {
+        if self.in_state(Self::FIN_RECVED) && self.kcp.nrcv_que() == 1 && self.kcp.nrcv_buf() == 0 {
+            // Abandon the FIN data.
+            self.kcp.recv_bytes();
+            None
+        } else {
+            self.kcp.recv_bytes()
+        }
+    }
+
     fn kcp_flush(&mut self) {
         if self.in_state(Self::FLUSH) {
             self.states ^= Self::FLUSH;
@@ -526,13 +572,13 @@ where
         }
     }
 
-    fn kcp_input(&mut self, data: Bytes) {
-        match self.kcp.input(&data) {
+    fn kcp_input(&mut self, mut data: BytesMut) {
+        match self.kcp.input(&mut data) {
             Ok(_) => self.states |= Self::FLUSH,
             Err(e) => match e.kind() {
                 io::ErrorKind::NotFound => {
                     // SYN handshake.
-                    if self.syn_handshake_input(data).is_ok() {
+                    if self.syn_handshake_input(&data).is_ok() {
                         return;
                     }
                     trace!(
@@ -542,14 +588,20 @@ where
                     );
                 }
                 io::ErrorKind::InvalidData => {
-                    let cmd = Kcp::read_cmd(data.deref());
-                    if cmd & Self::KCP_RESET == 0 {
+                    let cmd = Kcp::read_cmd(&data);
+                    if cmd & Self::KCP_RESET != 0 {
                         self.reset_connection();
                         return;
                     }
-                    if cmd & Self::KCP_FIN == 0 && self.fin_handshake_input(data).is_ok() {
-                        // TODO:
-                        return;
+                    if cmd & Self::KCP_FIN != 0 {
+                        if !self.in_state(Self::FIN_RECVED) {
+                            self.states |= Self::FIN_RECVED;
+                        }
+                        self.fin_state_transite();
+                        Kcp::write_cmd(&mut data, cmd ^ Self::KCP_FIN);
+                        if self.kcp.input(&data).is_ok() {
+                            return;
+                        }
                     }
                     trace!("packet parse error");
                 }
@@ -558,8 +610,16 @@ where
         }
     }
 
-    async fn kcp_output(kcp: &mut Kcp, sink: &mut T) {
-        while let Some(data) = kcp.pop_output() {
+    async fn kcp_output(kcp: &mut Kcp, sink: &mut T, states: u32) {
+        while let Some(mut data) = kcp.pop_output() {
+            if states & Self::FIN_HANDSHAKE != 0 {
+                // Set KCP_FIN flag for FIN handshake.
+                if Kcp::read_payload_data(&data).is_some() {
+                    let cmd = Kcp::read_cmd(&data);
+                    Kcp::write_cmd(&mut data, cmd | Self::KCP_FIN);
+                }
+            }
+
             if let Err(e) = sink.feed(data.into()).await {
                 // clear all output buffers on error
                 while kcp.pop_output().is_some() {}
