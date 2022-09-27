@@ -1,13 +1,13 @@
-use ::kcp::udp::*;
-
-use ::bytes::Bytes;
-use ::futures::{SinkExt, StreamExt};
-use ::log::info;
-use ::std::{sync::Arc, time::Duration};
-use ::tokio::select;
-
+#[cfg(feature = "udp")]
 #[tokio::test]
 async fn test_udp_stream() {
+    use ::bytes::Bytes;
+    use ::futures::{SinkExt, StreamExt};
+    use ::kcp::udp::*;
+    use ::log::info;
+    use ::std::{sync::Arc, time::Duration};
+    use ::tokio::select;
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
         .format_timestamp_micros()
         .is_test(true)

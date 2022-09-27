@@ -117,9 +117,9 @@ impl KcpUdpStream {
             .next()
             .ok_or(io::ErrorKind::AddrNotAvailable)?;
 
-        KcpStream::connect(
+        KcpStream::connect::<_, BytesMut, _>(
             config,
-            KcpUdpTransport::new(udp, addr),
+            UdpTransport::new(udp, addr),
             futures::sink::drain(),
             None,
         )
@@ -388,7 +388,7 @@ impl Task {
         if let Ok(stream) = KcpStream::accept(
             config,
             conv,
-            KcpChannelTransport::new(data_tx, receiver),
+            TokioMpscTransport::new(data_tx, receiver),
             disconnect,
             Some(token),
         )

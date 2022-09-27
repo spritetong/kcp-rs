@@ -2,9 +2,11 @@
 
 pub mod config;
 pub mod protocol;
-pub mod transport;
 
 pub use crate::config::{KcpConfig, KcpNoDelayConfig};
+
+#[cfg(feature = "stream")]
+pub mod transport;
 
 #[cfg(feature = "stream")]
 pub mod stream;

@@ -1,7 +1,7 @@
 pub use crate::config::*;
 use crate::protocol::Kcp;
 
-use ::bytes::{Bytes, BytesMut};
+use ::bytes::{BufMut, Bytes, BytesMut};
 use ::futures::{future::poll_fn, ready, FutureExt, Sink, SinkExt, Stream, StreamExt};
 use ::log::{error, trace, warn};
 use ::std::{
@@ -388,13 +388,9 @@ where
 
     fn syn_handshake_send(&mut self) {
         self.states |= Self::FLUSH;
-        let syn: Vec<u8> = self
-            .config
-            .session_key
-            .iter()
-            .chain(self.session_id.iter())
-            .map(|&x| x)
-            .collect();
+        let mut syn = Vec::<u8>::new();
+        syn.put_slice(&self.config.session_key);
+        syn.put_slice(&self.session_id);
         self.kcp.send(syn.as_slice()).unwrap();
         self.kcp_flush();
     }

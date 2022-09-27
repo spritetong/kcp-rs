@@ -99,8 +99,8 @@ impl Default for KcpConfig {
 
 impl KcpConfig {
     pub fn random_session_id(&self) -> Vec<u8> {
-        std::iter::repeat_with(|| rand::random::<u8>())
+        std::iter::repeat_with(rand::random::<u8>)
             .take(self.session_id_len)
-            .collect()        
+            .collect()
     }
 }
