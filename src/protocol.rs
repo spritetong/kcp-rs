@@ -267,6 +267,21 @@ impl Kcp {
         self.output_queue.pop_front()
     }
 
+    pub fn gen_packet_head(&self, cmd: u8) -> BytesMut {
+        let mut header = BytesMut::with_capacity(IKCP_OVERHEAD as usize);
+        let kcp = self.as_ref();
+        header.put_u32_le(kcp.conv);
+        header.put_u8(cmd);
+        header.put_u8(0);
+        header.put_u16_le(kcp.rcv_wnd as u16);
+        header.put_u32_le(self.get_system_time());
+        header.put_u32_le(kcp.snd_nxt);
+        header.put_u32_le(kcp.rcv_nxt);
+        header.put_u32_le(0);
+        header.put_u32_le(0);
+        header
+    }
+
     /// Read conv from a packet buffer.
     #[inline]
     pub fn read_conv(buf: &[u8]) -> Option<u32> {
