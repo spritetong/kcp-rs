@@ -150,6 +150,9 @@ impl Kcp {
 
     /// io::ErrorKind::InvalidInput - frame is too large.
     pub fn send(&mut self, data: &[u8]) -> io::Result<usize> {
+        if data.is_empty() {
+            return Ok(0);
+        }
         match unsafe { ikcp_send(self.as_mut(), data.as_ptr() as _, data.len() as c_int) } {
             size if size >= 0 => Ok(size as usize),
             -1 | -2 => Err(io::ErrorKind::InvalidInput.into()),

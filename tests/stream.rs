@@ -73,6 +73,10 @@ async fn test_stream() {
     s1.send(Bytes::from_static(b"12345")).await.unwrap();
     info!("{:?}", s2.next().await);
 
+    s1.shutdown_immediately();
+    assert!(s1.next().await.is_none());
+    assert!(s2.next().await.is_none());
+
     let frame = Bytes::from(vec![0u8; 300000]);
     let start = std::time::Instant::now();
     let mut received = 0;
