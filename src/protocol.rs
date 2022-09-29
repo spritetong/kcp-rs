@@ -267,19 +267,18 @@ impl Kcp {
         self.output_queue.pop_front()
     }
 
-    pub fn gen_packet_head(&self, cmd: u8) -> BytesMut {
-        let mut header = BytesMut::with_capacity(IKCP_OVERHEAD as usize);
+    pub fn write_ack_head(&self, buf: &mut BytesMut, cmd_flags: u8, payload_size: usize) {
+        buf.reserve(IKCP_OVERHEAD as usize + payload_size);
         let kcp = self.as_ref();
-        header.put_u32_le(kcp.conv);
-        header.put_u8(cmd);
-        header.put_u8(0);
-        header.put_u16_le(kcp.rcv_wnd as u16);
-        header.put_u32_le(self.get_system_time());
-        header.put_u32_le(kcp.snd_nxt);
-        header.put_u32_le(kcp.rcv_nxt);
-        header.put_u32_le(0);
-        header.put_u32_le(0);
-        header
+        buf.put_u32_le(kcp.conv);
+        buf.put_u8(IKCP_CMD_ACK as u8 | cmd_flags);
+        buf.put_u8(0);
+        buf.put_u16_le(kcp.rcv_wnd as u16);
+        buf.put_u32_le(self.get_system_time());
+        buf.put_u32_le(kcp.snd_nxt);
+        buf.put_u32_le(kcp.rcv_nxt);
+        buf.put_u32_le(0);
+        buf.put_u32_le(payload_size as u32);
     }
 
     /// Read conv from a packet buffer.

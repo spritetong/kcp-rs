@@ -33,6 +33,8 @@ pub struct KcpStream {
 }
 
 impl KcpStream {
+    pub const SYN_CONV: u32 = 0xFFFF_FFFE;
+
     /// Check if a conv is valid.
     #[inline]
     pub fn is_valid_conv(conv: u32) -> bool {
@@ -61,8 +63,6 @@ impl KcpStream {
 }
 
 impl KcpStream {
-    pub const SYN_CONV: u32 = 0xFFFF_FFFE;
-
     pub async fn connect<T, Si, D>(
         config: Arc<KcpConfig>,
         transport: T,
@@ -132,8 +132,9 @@ impl KcpStream {
                     input_rx,
                     token,
                     rx_buf: BytesMut::new(),
-                    states: Task::SYN_HANDSHAKE,
-                    fin_end_time: 0,
+                    hs: Handshake::Syn,
+                    flags: 0,
+                    hs_end_time: 0,
                     last_io_time: 0,
                     session_id: Default::default(),
                 }
@@ -196,6 +197,16 @@ enum Output {
     Frame(Bytes),
 }
 
+#[derive(Clone, Copy, PartialOrd, PartialEq, Eq, Debug)]
+enum Handshake {
+    Syn,
+    Connected,
+    FinPending,
+    FinSent,
+    FinWaitPeer,
+    Disconnected,
+}
+
 struct Task {
     kcp: Kcp,
     config: Arc<KcpConfig>,
@@ -203,22 +214,18 @@ struct Task {
     token: CancellationToken,
     rx_buf: BytesMut,
 
-    states: u32,
-    fin_end_time: u32,
+    hs: Handshake,
+    flags: u32,
+    hs_end_time: u32,
     last_io_time: u32,
     session_id: Vec<u8>,
 }
 
 impl Task {
-    const SYN_HANDSHAKE: u32 = 0x01;
-    const FIN_RECVED: u32 = 0x02;
-    const FIN_PENDING: u32 = 0x04;
-    const FIN_HANDSHAKE: u32 = 0x08;
-    const FIN_WAIT_PEER: u32 = 0x10;
-    const INPUT_CLOSED: u32 = 0x100;
-    const DISCONNECTED: u32 = 0x200;
-    const CLIENT: u32 = 0x800;
-    const FLUSH: u32 = 0x1000;
+    const CLIENT: u32 = 0x01;
+    const FLUSH: u32 = 0x02;
+    const FIN_RECVED: u32 = 0x04;
+    const INPUT_CLOSED: u32 = 0x08;
 
     const CMD_MASK: u8 = 0x57;
     const KCP_SYN: u8 = 0x80;
@@ -243,7 +250,7 @@ impl Task {
         self.kcp.set_nodelay(true, 100, 0, false);
         self.last_io_time = self.kcp.current();
         if self.kcp.conv() == KcpStream::SYN_CONV {
-            self.states |= Self::CLIENT;
+            self.flags |= Self::CLIENT;
             // Create random session ID for handshake.
             self.session_id = self.config.random_session_id();
             // Send SYN packet.
@@ -256,12 +263,12 @@ impl Task {
             if self.kcp.has_ouput() {
                 select! {
                     biased;
-                    _ = Self::kcp_output(&mut self.kcp, &mut transport, self.states) => (),
+                    _ = Self::kcp_output(&mut self.kcp, &mut transport, self.hs) => (),
                     _ = self.token.cancelled() => break,
                 }
             }
 
-            if self.in_state(Self::DISCONNECTED) {
+            if self.hs == Handshake::Disconnected {
                 break;
             }
 
@@ -274,12 +281,13 @@ impl Task {
             }
 
             let current = self.kcp.get_system_time();
-            let interval = self.kcp.check(current).wrapping_sub(current).min(60000);
-            if self.is_fin_handshaking() {
-                if self.fin_end_time.wrapping_sub(current) > 0 {
-                    // TODO:
+            let mut interval = self.kcp.check(current).wrapping_sub(current).min(60000);
+            if self.is_fin_handshake() {
+                let timeout = self.hs_end_time.wrapping_sub(current);
+                if timeout as i32 > 0 {
+                    interval = interval.min(timeout);
                 } else {
-                    self.disconnect();
+                    self.set_handshake(Handshake::Disconnected);
                 }
             }
             if interval == 0 {
@@ -288,7 +296,7 @@ impl Task {
             }
 
             select! {
-                x = self.input_rx.recv(), if !self.in_state(Self::INPUT_CLOSED)
+                x = self.input_rx.recv(), if !self.has(Self::INPUT_CLOSED)
                         && !self.kcp.is_send_queue_full() => {
                     let mut closed = false;
                     match x {
@@ -310,7 +318,7 @@ impl Task {
                     }
                     if closed {
                         log::debug!("({}) Input channel closed, starting FIN handshake", self.is_client());
-                        self.states |= Self::INPUT_CLOSED;
+                        self.flags |= Self::INPUT_CLOSED;
                         self.fin_transite_state();
                     }
                     // Try to flush.
@@ -354,12 +362,12 @@ impl Task {
                             }).await;
 
                             // SYN handshake.
-                            if self.in_state(Self::SYN_HANDSHAKE) &&
+                            if self.hs == Handshake::Syn &&
                                     self.syn_handshake_recv(&output_tx).is_err() {
-                                self.disconnect();
+                                self.set_handshake(Handshake::Disconnected);
                             }
                             // FIN handshake.
-                            if self.is_fin_handshaking() {
+                            if self.is_fin_handshake() {
                                 self.fin_transite_state();
                             }
 
@@ -388,10 +396,9 @@ impl Task {
 
         // TODO: send RESET packet.
         if KcpStream::is_valid_conv(self.kcp.conv()) {
-            transport
-                .send(self.kcp.gen_packet_head(82 | Self::KCP_RESET).into())
-                .await
-                .ok();
+            let mut buf = BytesMut::new();
+            self.kcp.write_ack_head(&mut buf, Self::KCP_RESET, 0);
+            transport.send(buf.into()).await.ok();
         }
 
         // Report disconnect.
@@ -408,16 +415,16 @@ impl Task {
 
     #[inline]
     fn is_client(&self) -> bool {
-        self.states & Self::CLIENT != 0
+        self.flags & Self::CLIENT != 0
     }
 
     #[inline]
-    fn in_state(&self, state: u32) -> bool {
-        self.states & state != 0
+    fn has(&self, state: u32) -> bool {
+        self.flags & state != 0
     }
 
     fn handshake_send(&mut self) {
-        self.states |= Self::FLUSH;
+        self.flags |= Self::FLUSH;
         let mut syn = Vec::<u8>::new();
         syn.put_slice(&self.config.session_key);
         syn.put_slice(&self.session_id);
@@ -456,7 +463,7 @@ impl Task {
             }
 
             // Connection has been established.
-            self.states &= !Self::SYN_HANDSHAKE;
+            self.set_handshake(Handshake::Connected);
             return output_tx
                 .try_send(Output::Connected {
                     conv: self.kcp.conv(),
@@ -470,7 +477,7 @@ impl Task {
         // Switch kcp's conv to try to accept the packet.
         if let Some(conv) = Kcp::read_conv(packet) {
             if self.is_client() {
-                if self.in_state(Self::SYN_HANDSHAKE) && conv != KcpStream::SYN_CONV {
+                if self.hs == Handshake::Syn && conv != KcpStream::SYN_CONV {
                     // For the client endpoint.
                     // Try to accept conv from the server.
                     self.kcp.set_conv(conv);
@@ -494,76 +501,70 @@ impl Task {
         Err(io::ErrorKind::InvalidInput.into())
     }
 
-    fn disconnect(&mut self) {
-        log::debug!("({}) receive RESET, into DISCONNECTED", self.is_client());
-        self.states &=
-            !(Self::SYN_HANDSHAKE | Self::FIN_PENDING | Self::FIN_HANDSHAKE | Self::FIN_WAIT_PEER);
-        self.states |= Self::DISCONNECTED;
+    #[inline]
+    fn is_fin_handshake(&self) -> bool {
+        (Handshake::FinPending..Handshake::FinWaitPeer).contains(&self.hs)
     }
 
     #[inline]
-    fn is_fin_handshaking(&self) -> bool {
-        self.in_state(Self::FIN_PENDING | Self::FIN_HANDSHAKE | Self::FIN_WAIT_PEER)
+    fn set_handshake(&mut self, hs: Handshake) {
+        log::debug!("({}) {:?} -> {:?}", self.is_client(), self.hs, hs);
+        self.hs = hs;
     }
 
     fn fin_transite_state(&mut self) {
-        if self.in_state(Self::SYN_HANDSHAKE) {
-            self.disconnect();
-        } else {
-            if !self.is_fin_handshaking() {
-                self.states |= Self::FIN_PENDING;
-                self.fin_end_time =
-                    self.kcp.get_system_time() + Self::DISCONNECT_TIMEOUT.as_secs() as u32 * 1000;
-                log::debug!("({}) into FIN_PENDING", self.is_client());
-            }
-
-            if self.in_state(Self::FIN_PENDING) {
-                log::debug!(
-                    "({}) in FIN_PENDING, input closed: {}, waitsnd: {}",
-                    self.is_client(),
-                    self.in_state(Self::INPUT_CLOSED),
-                    self.kcp.get_waitsnd()
-                );
-                if self.in_state(Self::INPUT_CLOSED) && self.kcp.get_waitsnd() == 0 {
-                    log::debug!("({}) into FIN_HANDSHAKE", self.is_client());
-                    self.states ^= Self::FIN_PENDING;
-                    self.states |= Self::FIN_HANDSHAKE;
+        loop {
+            self.hs = match self.hs {
+                Handshake::Syn => Handshake::Disconnected,
+                Handshake::Connected => {
+                    self.hs_end_time = self.kcp.get_system_time()
+                        + Self::DISCONNECT_TIMEOUT.as_secs() as u32 * 1000;
+                    Handshake::FinPending
+                }
+                Handshake::FinPending => {
+                    log::debug!(
+                        "({}) in {:?}, input closed: {}, waitsnd: {}",
+                        self.is_client(),
+                        self.hs,
+                        self.has(Self::INPUT_CLOSED),
+                        self.kcp.get_waitsnd()
+                    );
+                    if !self.has(Self::INPUT_CLOSED) || self.kcp.get_waitsnd() > 0 {
+                        break;
+                    }
                     self.handshake_send();
+                    Handshake::FinSent
                 }
-            }
-
-            if self.in_state(Self::FIN_HANDSHAKE) {
-                log::debug!(
-                    "({}) in FIN_HANDSHAKE, waitsnd: {}",
-                    self.is_client(),
-                    self.kcp.get_waitsnd()
-                );
-                if self.kcp.get_waitsnd() == 0 {
-                    log::debug!("({}) into FIN_WAIT_PEER", self.is_client());
-                    self.states ^= Self::FIN_HANDSHAKE;
-                    self.states |= Self::FIN_WAIT_PEER;
+                Handshake::FinSent => {
+                    log::debug!(
+                        "({}) in {:?}, waitsnd: {}",
+                        self.is_client(),
+                        self.hs,
+                        self.kcp.get_waitsnd()
+                    );
+                    if self.kcp.get_waitsnd() > 0 {
+                        break;
+                    }
+                    Handshake::FinWaitPeer
                 }
-            }
-
-            if self.in_state(Self::FIN_WAIT_PEER) {
-                log::debug!(
-                    "({}) in FIN_WAIT_PEER, waitsnd: {} + {}",
-                    self.is_client(),
-                    self.kcp.nrcv_que(),
-                    self.kcp.nrcv_buf(),
-                );
-                // KCP: ensure all frames have been received.
-                if self.in_state(Self::FIN_RECVED) && self.kcp.nrcv_que() + self.kcp.nrcv_buf() == 0
-                {
-                    log::debug!("({}) into DISCONNECTED", self.is_client());
-                    self.states ^= Self::FIN_WAIT_PEER;
-                    self.states |= Self::DISCONNECTED;
+                Handshake::FinWaitPeer => {
+                    log::debug!(
+                        "({}) in {:?}, waitsnd: {} + {}",
+                        self.is_client(),
+                        self.hs,
+                        self.kcp.nrcv_que(),
+                        self.kcp.nrcv_buf(),
+                    );
+                    // KCP: ensure all frames have been received.
+                    if !self.has(Self::FIN_RECVED) || self.kcp.nrcv_que() + self.kcp.nrcv_buf() > 0
+                    {
+                        break;
+                    }
+                    Handshake::Disconnected
                 }
-            }
+                Handshake::Disconnected => break,
+            };
         }
-
-        // Always flush for FIN handshake.
-        self.states |= Self::FLUSH;
     }
 
     fn process_input(&mut self, frame: Bytes) {
@@ -571,7 +572,7 @@ impl Task {
             Ok(_) => {
                 // KCP: flush if it's no delay or the number of not-sent buffers is greater than 1.
                 if self.config.nodelay.nodelay || self.kcp.nsnd_que() > 1 {
-                    self.states |= Self::FLUSH;
+                    self.flags |= Self::FLUSH;
                 }
             }
             _ => error!(
@@ -607,7 +608,7 @@ impl Task {
 
     fn kcp_recv(&mut self) -> Option<Bytes> {
         // KCP: FIN frame is the last one in the stream.
-        if self.in_state(Self::FIN_RECVED) && self.kcp.nrcv_que() == 1 && self.kcp.nrcv_buf() == 0 {
+        if self.has(Self::FIN_RECVED) && self.kcp.nrcv_que() == 1 && self.kcp.nrcv_buf() == 0 {
             // Check the session key and ID of the FIN frame.
             if let Some(fin) = self.kcp.recv_bytes() {
                 if Some(&self.session_id[..]) == fin.strip_prefix(self.config.session_key.deref()) {
@@ -621,8 +622,8 @@ impl Task {
     }
 
     fn kcp_flush(&mut self) {
-        if self.in_state(Self::FLUSH) {
-            self.states ^= Self::FLUSH;
+        if self.has(Self::FLUSH) {
+            self.flags ^= Self::FLUSH;
             self.kcp.update(self.kcp.get_system_time());
             self.kcp.flush();
             self.last_io_time = self.kcp.current();
@@ -631,7 +632,7 @@ impl Task {
 
     fn kcp_input(&mut self, mut packet: BytesMut) {
         match self.kcp.input(&mut packet) {
-            Ok(_) => self.states |= Self::FLUSH,
+            Ok(_) => self.flags |= Self::FLUSH,
             Err(e) => match e.kind() {
                 io::ErrorKind::NotFound => {
                     // SYN handshake.
@@ -647,13 +648,13 @@ impl Task {
                 io::ErrorKind::InvalidData => {
                     let cmd = Kcp::read_cmd(&packet);
                     if cmd & Self::KCP_RESET != 0 {
-                        log::debug!("({}) receive RESET, into DISCONNECTED", self.is_client());
-                        self.disconnect();
+                        log::debug!("({}) receive RESET", self.is_client());
+                        self.set_handshake(Handshake::Disconnected);
                         return;
                     }
                     if cmd & Self::KCP_FIN != 0 {
-                        if !self.in_state(Self::FIN_RECVED) {
-                            self.states |= Self::FIN_RECVED;
+                        if !self.has(Self::FIN_RECVED) {
+                            self.flags |= Self::FIN_RECVED;
                             // Do not get any more input.
                             self.input_rx.close();
                         }
@@ -670,14 +671,14 @@ impl Task {
         }
     }
 
-    async fn kcp_output<T, Si>(kcp: &mut Kcp, sink: &mut T, states: u32)
+    async fn kcp_output<T, Si>(kcp: &mut Kcp, sink: &mut T, hs: Handshake)
     where
         T: Sink<Si> + Stream<Item = BytesMut> + Unpin,
         Si: From<BytesMut> + Send,
         <T as Sink<Si>>::Error: Display,
     {
         while let Some(mut packet) = kcp.pop_output() {
-            if states & Self::FIN_HANDSHAKE != 0 {
+            if hs == Handshake::FinSent {
                 // Set KCP_FIN flag for FIN handshake.
                 if Kcp::read_payload_data(&packet).is_some() {
                     let cmd = Kcp::read_cmd(&packet) | Self::KCP_FIN;
