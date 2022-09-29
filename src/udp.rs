@@ -18,7 +18,7 @@ use ::std::{
 use ::tokio::{
     net::{lookup_host, ToSocketAddrs, UdpSocket},
     select,
-    sync::mpsc::{channel, Receiver, Sender},
+    sync::mpsc::{channel, unbounded_channel, Receiver, Sender, UnboundedSender},
     task::JoinHandle,
 };
 use ::tokio_util::{
@@ -26,6 +26,7 @@ use ::tokio_util::{
     sync::{CancellationToken, PollSendError, PollSender},
     udp::UdpFramed,
 };
+use tokio::sync::mpsc::UnboundedReceiver;
 
 pub struct KcpUdpStream {
     config: Arc<KcpConfig>,
@@ -53,20 +54,20 @@ impl KcpUdpStream {
         let backlog = backlog.max(8);
         let (stream_tx, stream_rx) = channel(backlog);
         let (msg_tx, msg_rx) = channel(backlog);
-        let (data_tx, data_rx) = channel(Task::DATA_QUEUE_SIZE);
+        let (pkt_tx, pkt_rx) = unbounded_channel();
         let task = Task::new(
             config.clone(),
             backlog,
             stream_tx,
             msg_tx,
-            data_tx,
+            pkt_tx,
             token.clone(),
         );
         Ok(Self {
             config,
             stream_rx,
             token,
-            task: Some(tokio::spawn(task.run(udp, msg_rx, data_rx))),
+            task: Some(tokio::spawn(task.run(udp, msg_rx, pkt_rx))),
         })
     }
 
@@ -164,7 +165,7 @@ struct Task {
     backlog: usize,
     stream_tx: Sender<(KcpStream, SocketAddr)>,
     msg_tx: Sender<Message>,
-    data_tx: Sender<Bytes>,
+    pkt_tx: UnboundedSender<(Bytes, SocketAddr)>,
     token: CancellationToken,
 
     rx_queue: VecDeque<(BytesMut, SocketAddr)>,
@@ -174,15 +175,14 @@ struct Task {
 }
 
 impl Task {
-    const DATA_QUEUE_SIZE: usize = 2048;
-    const DATA_QUEUE_LOOP: usize = 1024;
+    const PACKET_QUEUE_LOOP: usize = 1024;
 
     fn new(
         config: Arc<KcpConfig>,
         backlog: usize,
         stream_tx: Sender<(KcpStream, SocketAddr)>,
         msg_tx: Sender<Message>,
-        data_tx: Sender<Bytes>,
+        pkt_tx: UnboundedSender<(Bytes, SocketAddr)>,
         token: CancellationToken,
     ) -> Self {
         Self {
@@ -190,9 +190,9 @@ impl Task {
             backlog,
             stream_tx,
             msg_tx,
-            data_tx,
+            pkt_tx,
             token,
-            rx_queue: VecDeque::with_capacity(Self::DATA_QUEUE_LOOP),
+            rx_queue: VecDeque::with_capacity(Self::PACKET_QUEUE_LOOP),
             conv_map: LinkedHashMap::new(),
             sid_map: LinkedHashMap::new(),
             accept_task_count: 0,
@@ -203,7 +203,7 @@ impl Task {
         mut self,
         udp: UdpSocket,
         mut msg_rx: Receiver<Message>,
-        mut data_rx: Receiver<Bytes>,
+        mut pkt_rx: UnboundedReceiver<(Bytes, SocketAddr)>,
     ) {
         let (mut udp_sink, mut udp_stream) = UdpFramed::new(udp, BytesCodec::new()).split();
         let token = self.token.clone();
@@ -255,17 +255,13 @@ impl Task {
                     }
                 }
 
-                Some(data) = data_rx.recv() => {
-                    if let Some(session) = KcpStream::read_conv(&data)
-                        .and_then(|conv|self.conv_map.get(&conv)) {
-                        let _ = udp_sink.feed((data, session.peer_addr)).await;
-                    }
+                Some(item) = pkt_rx.recv() => {
+                    let _ = udp_sink.feed(item).await;
                     // Try send more.
-                    for _ in 0..Self::DATA_QUEUE_LOOP {
-                        match data_rx.try_recv() {
-                            Ok(data) => if let Some(session) = KcpStream::read_conv(&data)
-                                .and_then(|conv|self.conv_map.get(&conv)) {
-                                let _ = udp_sink.feed((data, session.peer_addr)).await;
+                    for _ in 0..Self::PACKET_QUEUE_LOOP {
+                        match pkt_rx.try_recv() {
+                            Ok(item) => {
+                                let _ = udp_sink.feed(item).await;
                             },
                             _ => break,
                         }
@@ -278,7 +274,7 @@ impl Task {
         }
 
         msg_rx.close();
-        data_rx.close();
+        pkt_rx.close();
 
         // Close all sessions.
         while let Some((_, session)) = self.conv_map.pop_front() {
@@ -351,8 +347,9 @@ impl Task {
                             task: Some(tokio::spawn(Self::accept_stream(
                                 self.config.clone(),
                                 conv,
+                                *peer_addr,
                                 receiver,
-                                self.data_tx.clone(),
+                                self.pkt_tx.clone(),
                                 self.msg_tx.clone(),
                                 token,
                             ))),
@@ -378,8 +375,9 @@ impl Task {
     async fn accept_stream(
         config: Arc<KcpConfig>,
         conv: u32,
+        peer_addr: SocketAddr,
         receiver: Receiver<BytesMut>,
-        data_tx: Sender<Bytes>,
+        pkt_tx: UnboundedSender<(Bytes, SocketAddr)>,
         msg_tx: Sender<Message>,
         token: CancellationToken,
     ) {
@@ -388,7 +386,7 @@ impl Task {
         if let Ok(stream) = KcpStream::accept(
             config,
             conv,
-            MpscTransport::new(data_tx, receiver),
+            UdpMpscTransport::new(Some(pkt_tx), receiver, peer_addr),
             disconnect,
             Some(token),
         )

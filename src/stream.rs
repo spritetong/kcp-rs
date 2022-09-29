@@ -4,19 +4,27 @@ use crate::protocol::Kcp;
 use ::bytes::{BufMut, Bytes, BytesMut};
 use ::futures::{future::poll_fn, ready, FutureExt, Sink, SinkExt, Stream, StreamExt};
 use ::log::{error, trace, warn};
+use ::once_cell::sync::Lazy;
 use ::std::{
     fmt::Display,
     io,
+    marker::PhantomData,
     ops::Deref,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
     time::Duration,
 };
 use ::tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     select,
-    sync::mpsc::{channel, error::TryRecvError, Receiver, Sender},
+    sync::{
+        mpsc::{channel, error::TryRecvError, Receiver, Sender},
+        Notify,
+    },
     task::JoinHandle,
 };
 use ::tokio_util::sync::{CancellationToken, PollSender};
@@ -71,7 +79,7 @@ impl KcpStream {
     ) -> io::Result<Self>
     where
         T: Sink<Si> + Stream<Item = BytesMut> + Send + Unpin + 'static,
-        Si: From<BytesMut> + Send + 'static,
+        Si: From<BytesMut> + Send + Unpin + 'static,
         <T as Sink<Si>>::Error: Display,
         D: Sink<u32> + Send + Unpin + 'static,
     {
@@ -89,7 +97,7 @@ impl KcpStream {
     ) -> io::Result<Self>
     where
         T: Sink<Si> + Stream<Item = BytesMut> + Send + Unpin + 'static,
-        Si: From<BytesMut> + Send + 'static,
+        Si: From<BytesMut> + Send + Unpin + 'static,
         <T as Sink<Si>>::Error: Display,
         D: Sink<u32> + Send + Unpin + 'static,
     {
@@ -102,6 +110,24 @@ impl KcpStream {
             .await
     }
 
+    #[inline]
+    pub fn config(&self) -> Arc<KcpConfig> {
+        self.config.clone()
+    }
+
+    #[inline]
+    pub fn conv(&self) -> u32 {
+        self.conv
+    }
+
+    /// Shutdown the input channel without awaiting.
+    pub fn shutdown_immediately(&mut self) {
+        self.input_sink.abort_send();
+        self.input_sink.close();
+    }
+}
+
+impl KcpStream {
     fn new<T, Si, D>(
         config: Arc<KcpConfig>,
         conv: u32,
@@ -111,7 +137,7 @@ impl KcpStream {
     ) -> Self
     where
         T: Sink<Si> + Stream<Item = BytesMut> + Send + Unpin + 'static,
-        Si: From<BytesMut> + Send + 'static,
+        Si: From<BytesMut> + Send + Unpin + 'static,
         <T as Sink<Si>>::Error: Display,
         D: Sink<u32> + Send + Unpin + 'static,
     {
@@ -144,24 +170,6 @@ impl KcpStream {
         }
     }
 
-    #[inline]
-    pub fn config(&self) -> Arc<KcpConfig> {
-        self.config.clone()
-    }
-
-    #[inline]
-    pub fn conv(&self) -> u32 {
-        self.conv
-    }
-
-    /// Shutdown the input channel without awaiting.
-    pub fn shutdown_immediately(&mut self) {
-        self.input_sink.abort_send();
-        self.input_sink.close();
-    }
-}
-
-impl KcpStream {
     async fn wait_connection(mut self) -> io::Result<Self> {
         let rst =
             match tokio::time::timeout(self.config.connect_timeout, self.output_rx.recv()).await {
@@ -186,6 +194,146 @@ impl KcpStream {
 impl Drop for KcpStream {
     fn drop(&mut self) {
         self.try_close();
+    }
+}
+
+impl Stream for KcpStream {
+    type Item = io::Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.read_buf.is_some() {
+            return Poll::Ready(Some(Ok(self.read_buf.take().unwrap())));
+        }
+        while let Some(x) = ready!(self.output_rx.poll_recv(cx)) {
+            match x {
+                Output::Frame(frame) => return Poll::Ready(Some(Ok(frame))),
+                _ => (),
+            }
+        }
+        Poll::Ready(None)
+    }
+}
+
+impl Sink<Bytes> for KcpStream {
+    type Error = io::Error;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.get_mut()
+            .input_sink
+            .poll_ready_unpin(cx)
+            .map_err(|_| io::Error::from(io::ErrorKind::NotConnected))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
+        self.get_mut()
+            .input_sink
+            .start_send_unpin(item)
+            .map_err(|_| io::Error::from(io::ErrorKind::NotConnected))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let this = self.get_mut();
+        let _ = ready!(this.input_sink.poll_close_unpin(cx));
+        this.try_close();
+        if let Some(task) = this.task.as_mut() {
+            let _ = ready!(task.poll_unpin(cx));
+            this.task.take();
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncRead for KcpStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        let this = self.get_mut();
+
+        while this.read_buf.is_none() {
+            match this.poll_next_unpin(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    if !chunk.is_empty() {
+                        this.read_buf = Some(chunk);
+                    }
+                }
+                Poll::Ready(Some(Err(err))) => return Poll::Ready(Err(err)),
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        if let Some(ref mut chunk) = this.read_buf {
+            let len = chunk.len().min(buf.remaining());
+            buf.put_slice(&chunk[..len]);
+            if len < chunk.len() {
+                let _ = chunk.split_to(len);
+            } else {
+                this.read_buf = None;
+            }
+        }
+
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for KcpStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        let this = self.get_mut();
+        let mut len = 0;
+
+        for chunk in buf.chunks(Kcp::max_frame_size(this.config.mtu) as usize) {
+            match this.poll_ready_unpin(cx) {
+                Poll::Ready(Ok(_)) => {
+                    if let Err(e) = this.start_send_unpin(Bytes::copy_from_slice(chunk)) {
+                        if len > 0 {
+                            break;
+                        }
+                        return Poll::Ready(Err(e));
+                    }
+                    len += chunk.len();
+                }
+                Poll::Ready(Err(e)) => {
+                    if len > 0 {
+                        break;
+                    }
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => {
+                    if len > 0 {
+                        break;
+                    }
+                    return Poll::Pending;
+                }
+            }
+        }
+
+        Poll::Ready(Ok(len))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        self.poll_close(cx)
     }
 }
 
@@ -238,8 +386,8 @@ impl Task {
 impl Task {
     async fn run<T, Si, D>(mut self, output_tx: Sender<Output>, mut transport: T, mut disconnect: D)
     where
-        T: Sink<Si> + Stream<Item = BytesMut> + Unpin,
-        Si: From<BytesMut> + Send,
+        T: Sink<Si> + Stream<Item = BytesMut> + Send + Unpin + 'static,
+        Si: From<BytesMut> + Send + Unpin + 'static,
         <T as Sink<Si>>::Error: Display,
         D: Sink<u32> + Send + Unpin,
     {
@@ -398,7 +546,7 @@ impl Task {
         if KcpStream::is_valid_conv(self.kcp.conv()) {
             let mut buf = BytesMut::new();
             self.kcp.write_ack_head(&mut buf, Self::KCP_RESET, 0);
-            transport.send(buf.into()).await.ok();
+            SHUTDOWN_POOL.create_task(Box::new(ShutdownSink::new(transport)), buf);
         }
 
         // Report disconnect.
@@ -514,7 +662,7 @@ impl Task {
 
     fn fin_transite_state(&mut self) {
         loop {
-            self.hs = match self.hs {
+            let state = match self.hs {
                 Handshake::Syn => Handshake::Disconnected,
                 Handshake::Connected => {
                     self.hs_end_time = self.kcp.get_system_time()
@@ -564,6 +712,7 @@ impl Task {
                 }
                 Handshake::Disconnected => break,
             };
+            self.set_handshake(state);
         }
     }
 
@@ -697,142 +846,142 @@ impl Task {
     }
 }
 
-impl Stream for KcpStream {
-    type Item = io::Result<Bytes>;
+////////////////////////////////////////////////////////////////////////////////
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.read_buf.is_some() {
-            return Poll::Ready(Some(Ok(self.read_buf.take().unwrap())));
-        }
-        while let Some(x) = ready!(self.output_rx.poll_recv(cx)) {
-            match x {
-                Output::Frame(frame) => return Poll::Ready(Some(Ok(frame))),
-                _ => (),
-            }
-        }
-        Poll::Ready(None)
+static SHUTDOWN_POOL: Lazy<ShutdownPool> = Lazy::new(ShutdownPool::new);
+
+struct ShutdownPool {
+    token: CancellationToken,
+    notify: Arc<Notify>,
+    task_count: Arc<AtomicUsize>,
+}
+
+struct ShutdownTask {
+    sink: Box<dyn Sink<BytesMut, Error = io::Error> + Send + Unpin>,
+    reset_packet: BytesMut,
+    token: CancellationToken,
+    notify: Arc<Notify>,
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for ShutdownTask {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Acquire);
+        self.notify.notify_one();
     }
 }
 
-impl Sink<Bytes> for KcpStream {
+impl ShutdownTask {
+    async fn run(mut self) {
+        for _ in 0..5 {
+            select! {
+                x = self.sink.send(self.reset_packet.clone()) => {
+                    if x.is_err() {
+                        break;
+                    }
+                }
+                _ = self.token.cancelled() => break,
+            }
+            if tokio::time::timeout(Duration::from_secs(1), self.token.cancelled())
+                .await
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+}
+
+impl ShutdownPool {
+    fn new() -> Self {
+        Self {
+            token: CancellationToken::new(),
+            notify: Arc::new(Notify::new()),
+            task_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn create_task(
+        &self,
+        sink: Box<dyn Sink<BytesMut, Error = io::Error> + Send + Unpin>,
+        reset_packet: BytesMut,
+    ) {
+        let token = self.token.child_token();
+        if self.token.is_cancelled() {
+            return;
+        }
+
+        self.task_count.fetch_add(1, Ordering::Release);
+        tokio::spawn(
+            ShutdownTask {
+                sink,
+                reset_packet,
+                token,
+                notify: self.notify.clone(),
+                counter: self.task_count.clone(),
+            }
+            .run(),
+        );
+    }
+
+    async fn cleanup(&self) {
+        self.token.cancel();
+        while self.task_count.load(Ordering::Acquire) > 0 {
+            self.notify.notified().await;
+        }
+    }
+}
+
+struct ShutdownSink<S, Si> {
+    sink: S,
+    _phantom: PhantomData<Si>,
+}
+
+impl<S, Si> ShutdownSink<S, Si> {
+    fn new(sink: S) -> Self {
+        Self {
+            sink,
+            _phantom: PhantomData::default(),
+        }
+    }
+}
+
+impl<S, Si> Sink<BytesMut> for ShutdownSink<S, Si>
+where
+    S: Sink<Si> + Send + Unpin,
+    Si: From<BytesMut> + Send + Unpin,
+{
     type Error = io::Error;
 
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.get_mut()
-            .input_sink
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.sink
             .poll_ready_unpin(cx)
-            .map_err(|_| io::Error::from(io::ErrorKind::NotConnected))
+            .map_err(|_| io::ErrorKind::NotConnected.into())
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.sink
+            .poll_flush_unpin(cx)
+            .map_err(|_| io::ErrorKind::NotConnected.into())
     }
 
-    fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
-        self.get_mut()
-            .input_sink
-            .start_send_unpin(item)
-            .map_err(|_| io::Error::from(io::ErrorKind::NotConnected))
+    fn start_send(mut self: Pin<&mut Self>, item: BytesMut) -> Result<(), Self::Error> {
+        self.sink
+            .start_send_unpin(item.into())
+            .map_err(|_| io::ErrorKind::NotConnected.into())
     }
 
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let this = self.get_mut();
-        let _ = ready!(this.input_sink.poll_close_unpin(cx));
-        this.try_close();
-        if let Some(task) = this.task.as_mut() {
-            let _ = ready!(task.poll_unpin(cx));
-            this.task.take();
-        }
-        Poll::Ready(Ok(()))
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.sink
+            .poll_close_unpin(cx)
+            .map_err(|_| io::ErrorKind::NotConnected.into())
     }
 }
 
-impl AsyncRead for KcpStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        if buf.remaining() == 0 {
-            return Poll::Ready(Ok(()));
-        }
-
-        let this = self.get_mut();
-
-        while this.read_buf.is_none() {
-            match this.poll_next_unpin(cx) {
-                Poll::Ready(Some(Ok(chunk))) => {
-                    if !chunk.is_empty() {
-                        this.read_buf = Some(chunk);
-                    }
-                }
-                Poll::Ready(Some(Err(err))) => return Poll::Ready(Err(err)),
-                Poll::Ready(None) => return Poll::Ready(Ok(())),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        if let Some(ref mut chunk) = this.read_buf {
-            let len = chunk.len().min(buf.remaining());
-            buf.put_slice(&chunk[..len]);
-            if len < chunk.len() {
-                let _ = chunk.split_to(len);
-            } else {
-                this.read_buf = None;
-            }
-        }
-
-        Poll::Ready(Ok(()))
-    }
+pub fn kcp_initialize() {
+    let _ = SHUTDOWN_POOL.deref();
 }
 
-impl AsyncWrite for KcpStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, io::Error>> {
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-
-        let this = self.get_mut();
-        let mut len = 0;
-
-        for chunk in buf.chunks(Kcp::max_frame_size(this.config.mtu) as usize) {
-            match this.poll_ready_unpin(cx) {
-                Poll::Ready(Ok(_)) => {
-                    if let Err(e) = this.start_send_unpin(Bytes::copy_from_slice(chunk)) {
-                        if len > 0 {
-                            break;
-                        }
-                        return Poll::Ready(Err(e));
-                    }
-                    len += chunk.len();
-                }
-                Poll::Ready(Err(e)) => {
-                    if len > 0 {
-                        break;
-                    }
-                    return Poll::Ready(Err(e));
-                }
-                Poll::Pending => {
-                    if len > 0 {
-                        break;
-                    }
-                    return Poll::Pending;
-                }
-            }
-        }
-
-        Poll::Ready(Ok(len))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        self.poll_close(cx)
-    }
+pub async fn kcp_cleanup() {
+    SHUTDOWN_POOL.cleanup().await;
 }
