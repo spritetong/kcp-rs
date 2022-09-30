@@ -1,10 +1,10 @@
 #[cfg(feature = "stream")]
 #[tokio::test]
 async fn test_stream() {
-    use ::kcp::{stream::*, transport::*};
-
     use ::bytes::{Bytes, BytesMut};
     use ::futures::{SinkExt, StreamExt};
+    use ::kcp::*;
+    use ::kcp::transport::*;
     use ::log::info;
     use ::std::{sync::Arc, time::Duration};
     use ::tokio::select;
@@ -57,7 +57,7 @@ async fn test_stream() {
     let (s1, s2) = tokio::join!(
         KcpStream::accept::<_, BytesMut, _>(
             config.clone(),
-            KcpStream::rand_conv(),
+            Kcp::rand_conv(),
             s1,
             futures::sink::drain(),
             None,

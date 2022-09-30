@@ -26,12 +26,13 @@ use ::tokio::{
         Notify,
     },
     task::JoinHandle,
+    time::{sleep, timeout},
 };
 use ::tokio_util::sync::{CancellationToken, PollSender};
 
 macro_rules! debug {
     ($($x:expr),* $(,)?) => {
-        //log::debug!($($x),*)
+        log::debug!($($x),*)
     };
 }
 
@@ -47,29 +48,6 @@ pub struct KcpStream {
 }
 
 impl KcpStream {
-    pub const SYN_CONV: u32 = 0xFFFF_FFFE;
-
-    /// Check if a conv is valid.
-    #[inline]
-    pub fn is_valid_conv(conv: u32) -> bool {
-        conv != 0 && conv < Self::SYN_CONV
-    }
-
-    /// Generate a random conv.
-    pub fn rand_conv() -> u32 {
-        loop {
-            let conv = rand::random();
-            if Self::is_valid_conv(conv) {
-                break conv;
-            }
-        }
-    }
-
-    #[inline]
-    pub fn read_conv(packet: &[u8]) -> Option<u32> {
-        Kcp::read_conv(packet)
-    }
-
     /// Read the session id from the SYN handshake packet.
     pub fn read_session_id<'a>(packet: &'a [u8], session_key: &[u8]) -> Option<&'a [u8]> {
         Kcp::read_payload_data(packet).and_then(|x| x.strip_prefix(session_key))
@@ -89,7 +67,7 @@ impl KcpStream {
         <T as Sink<Si>>::Error: Display,
         D: Sink<u32> + Send + Unpin + 'static,
     {
-        Self::new(config.clone(), Self::SYN_CONV, transport, disconnect, token)
+        Self::new(config.clone(), Kcp::SYN_CONV, transport, disconnect, token)
             .wait_connection()
             .await
     }
@@ -107,7 +85,7 @@ impl KcpStream {
         <T as Sink<Si>>::Error: Display,
         D: Sink<u32> + Send + Unpin + 'static,
     {
-        if !KcpStream::is_valid_conv(conv) {
+        if !Kcp::is_valid_conv(conv) {
             error!("Invalid conv 0x{:08X}", conv);
             return Err(io::ErrorKind::InvalidInput.into());
         }
@@ -169,6 +147,7 @@ impl KcpStream {
                     hs_end_time: 0,
                     last_io_time: 0,
                     session_id: Default::default(),
+                    _phantom: Default::default(),
                 }
                 .run(output_tx, transport, disconnect),
             )),
@@ -177,16 +156,14 @@ impl KcpStream {
     }
 
     async fn wait_connection(mut self) -> io::Result<Self> {
-        let rst =
-            match tokio::time::timeout(self.config.connect_timeout, self.output_rx.recv()).await {
-                Ok(Some(Output::Connected { conv })) => {
-                    trace!("Connect conv {}", conv);
-                    self.conv = conv;
-                    return Ok(self);
-                }
-                Ok(_) => Err(io::ErrorKind::NotConnected.into()),
-                _ => Err(io::ErrorKind::TimedOut.into()),
-            };
+        let rst = match self.output_rx.recv().await {
+            Some(Output::Connected { conv }) => {
+                trace!("Connect conv {}", conv);
+                self.conv = conv;
+                return Ok(self);
+            }
+            _ => Err(io::ErrorKind::TimedOut.into()),
+        };
         self.close().await.ok();
         rst
     }
@@ -211,9 +188,8 @@ impl Stream for KcpStream {
             return Poll::Ready(Some(Ok(self.read_buf.take().unwrap())));
         }
         while let Some(x) = ready!(self.output_rx.poll_recv(cx)) {
-            match x {
-                Output::Frame(frame) => return Poll::Ready(Some(Ok(frame))),
-                _ => (),
+            if let Output::Frame(frame) = x {
+                return Poll::Ready(Some(Ok(frame)));
             }
         }
         Poll::Ready(None)
@@ -361,7 +337,7 @@ enum Handshake {
     Disconnected,
 }
 
-struct Task {
+struct Task<T, Si> {
     kcp: Kcp,
     config: Arc<KcpConfig>,
     input_rx: Receiver<Bytes>,
@@ -373,9 +349,10 @@ struct Task {
     hs_end_time: u32,
     last_io_time: u32,
     session_id: Vec<u8>,
+    _phantom: PhantomData<(T, Si)>,
 }
 
-impl Task {
+impl<T, Si> Task<T, Si> {
     const CLIENT: u32 = 0x01;
     const FLUSH: u32 = 0x02;
     const FIN_RECVED: u32 = 0x04;
@@ -386,60 +363,64 @@ impl Task {
     const KCP_FIN: u8 = 0x20;
     const KCP_RESET: u8 = 0x08;
 
-    const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[inline]
+    fn is_client(&self) -> bool {
+        self.flags & Self::CLIENT != 0
+    }
 }
 
-impl std::fmt::Display for Task {
+impl<T, Si> std::fmt::Display for Task<T, Si> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}({}, {:?})",
-            if self.is_client() {
-                "Connect"
-            } else {
-                "Accept"
-            },
+            "KcpStream({}-{} {:?})",
             self.kcp.conv(),
+            self.is_client() as i32,
             self.hs
         )
     }
 }
 
-impl Task {
-    async fn run<T, Si, D>(mut self, output_tx: Sender<Output>, mut transport: T, mut disconnect: D)
+impl<T, Si> Task<T, Si>
+where
+    T: Sink<Si> + Stream<Item = BytesMut> + Send + Unpin + 'static,
+    Si: From<BytesMut> + Send + Unpin + 'static,
+    <T as Sink<Si>>::Error: Display,
+{
+    async fn run<D>(mut self, output_tx: Sender<Output>, mut transport: T, mut disconnect: D)
     where
-        T: Sink<Si> + Stream<Item = BytesMut> + Send + Unpin + 'static,
-        Si: From<BytesMut> + Send + Unpin + 'static,
-        <T as Sink<Si>>::Error: Display,
         D: Sink<u32> + Send + Unpin,
     {
         self.kcp.initialize();
         self.kcp_apply_config();
 
         // Prepare for SYN handshake.
+        self.hs = Handshake::Syn;
+        self.hs_end_time =
+            self.kcp.get_system_time() + self.config.connect_timeout.as_secs() as u32 * 1000;
         self.kcp.set_nodelay(true, 100, 0, false);
         self.last_io_time = self.kcp.current();
-        if self.kcp.conv() == KcpStream::SYN_CONV {
+        if self.kcp.conv() == Kcp::SYN_CONV {
             self.flags |= Self::CLIENT;
             // Create random session ID for handshake.
             self.session_id = self.config.random_session_id();
             // Send SYN packet.
-            self.kcp.set_conv(KcpStream::SYN_CONV);
+            self.kcp.set_conv(Kcp::SYN_CONV);
             self.handshake_send();
         }
 
         let mut tx_frame: Option<Bytes> = None;
-        loop {
+        while self.hs != Handshake::Disconnected {
             if self.kcp.has_ouput() {
                 select! {
                     biased;
-                    _ = Self::kcp_output(&mut self.kcp, &mut transport, self.hs) => (),
+                    x = Self::kcp_output(&mut self.kcp, &mut transport, self.hs) => {
+                        if x.is_err() { break; }
+                    }
                     _ = self.token.cancelled() => break,
                 }
-            }
-
-            if self.hs == Handshake::Disconnected {
-                break;
             }
 
             if self.kcp.is_dead_link()
@@ -452,7 +433,7 @@ impl Task {
 
             let current = self.kcp.get_system_time();
             let mut interval = self.kcp.check(current).wrapping_sub(current).min(60000);
-            if self.is_fin_handshake() {
+            if self.hs != Handshake::Connected {
                 let timeout = self.hs_end_time.wrapping_sub(current);
                 if timeout as i32 > 0 {
                     interval = interval.min(timeout);
@@ -552,7 +533,7 @@ impl Task {
                     }
                 }
 
-                _ = tokio::time::sleep(Duration::from_millis(interval as u64)) => (),
+                _ = sleep(Duration::from_millis(interval as u64)) => (),
                 _ = self.token.cancelled() => break,
             }
         }
@@ -564,21 +545,29 @@ impl Task {
         self.input_rx.close();
         while self.input_rx.recv().await.is_some() {}
 
-        if KcpStream::is_valid_conv(self.kcp.conv()) {
-            let mut buf = BytesMut::new();
-            self.kcp.write_ack_head(&mut buf, Self::KCP_RESET, 0);
-            SHUTDOWN_POOL
-                .create_task(Box::new(ShutdownSink::new(transport)), buf)
-                .await;
-        }
+        timeout(Self::SHUTDOWN_TIMEOUT, self.flush_and_shutdown(transport))
+            .await
+            .ok();
 
         // Report disconnect.
         disconnect.send(self.kcp.conv()).await.ok();
     }
 
-    #[inline]
-    fn is_client(&self) -> bool {
-        self.flags & Self::CLIENT != 0
+    async fn flush_and_shutdown(&mut self, mut sink: T) {
+        self.flags |= Self::FLUSH;
+        self.kcp_flush();
+
+        Self::kcp_output(&mut self.kcp, &mut sink, self.hs)
+            .await
+            .ok();
+
+        if Kcp::is_valid_conv(self.kcp.conv()) {
+            let mut buf = BytesMut::new();
+            self.kcp.write_ack_head(&mut buf, Self::KCP_RESET, 0);
+            SHUTDOWN_POOL
+                .create_task(Box::new(ShutdownSink::new(sink)), buf)
+                .await;
+        }
     }
 
     #[inline]
@@ -640,17 +629,17 @@ impl Task {
         // Switch kcp's conv to try to accept the packet.
         if let Some(conv) = Kcp::read_conv(packet) {
             if self.is_client() {
-                if self.hs == Handshake::Syn && conv != KcpStream::SYN_CONV {
+                if self.hs == Handshake::Syn && conv != Kcp::SYN_CONV {
                     // For the client endpoint.
                     // Try to accept conv from the server.
                     self.kcp.set_conv(conv);
                     if self.kcp.input(packet).is_err() || self.kcp.get_waitsnd() > 0 {
                         // Restore conv if failed.
-                        self.kcp.set_conv(KcpStream::SYN_CONV);
+                        self.kcp.set_conv(Kcp::SYN_CONV);
                     }
                 }
                 return Ok(());
-            } else if conv == KcpStream::SYN_CONV {
+            } else if conv == Kcp::SYN_CONV {
                 // For the server endpoint.
                 let mine = self.kcp.conv();
                 // Switch conv temporarily.
@@ -669,10 +658,11 @@ impl Task {
         (Handshake::FinPending..Handshake::FinWaitPeer).contains(&self.hs)
     }
 
-    #[inline]
     fn set_handshake(&mut self, hs: Handshake) {
-        debug!("{} -> {:?}", self, hs);
-        self.hs = hs;
+        if self.hs != hs {
+            debug!("{} -> {:?}", self, hs);
+            self.hs = hs;
+        }
     }
 
     fn fin_transite_state(&mut self) {
@@ -681,7 +671,7 @@ impl Task {
                 Handshake::Syn => Handshake::Disconnected,
                 Handshake::Connected => {
                     self.hs_end_time = self.kcp.get_system_time()
-                        + Self::DISCONNECT_TIMEOUT.as_secs() as u32 * 1000;
+                        + self.config.shutdown_timeout.as_secs() as u32 * 1000;
                     Handshake::FinPending
                 }
                 Handshake::FinPending => {
@@ -788,7 +778,7 @@ impl Task {
     }
 
     fn kcp_input(&mut self, mut packet: BytesMut) {
-        match self.kcp.input(&mut packet) {
+        match self.kcp.input(&packet) {
             Ok(_) => self.flags |= Self::FLUSH,
             Err(e) => match e.kind() {
                 io::ErrorKind::NotFound => {
@@ -828,12 +818,7 @@ impl Task {
         }
     }
 
-    async fn kcp_output<T, Si>(kcp: &mut Kcp, sink: &mut T, hs: Handshake)
-    where
-        T: Sink<Si> + Stream<Item = BytesMut> + Unpin,
-        Si: From<BytesMut> + Send,
-        <T as Sink<Si>>::Error: Display,
-    {
+    async fn kcp_output(kcp: &mut Kcp, sink: &mut T, hs: Handshake) -> Result<(), ()> {
         while let Some(mut packet) = kcp.pop_output() {
             if hs == Handshake::FinSent {
                 // Set KCP_FIN flag for FIN handshake.
@@ -850,7 +835,8 @@ impl Task {
                 break;
             }
         }
-        sink.flush().await.ok();
+        sink.flush().await.map_err(|_| ())?;
+        Ok(())
     }
 }
 
@@ -884,7 +870,7 @@ impl ShutdownTask {
         for _ in 0..(5 - 1) {
             select! {
                 biased;
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                _ = sleep(Duration::from_secs(1)) => {
                     if self.send().await.is_err() {
                         break;
                     }

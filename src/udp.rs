@@ -1,5 +1,6 @@
-pub use crate::stream::*;
+use crate::protocol::Kcp;
 use crate::transport::*;
+use crate::{conv::ConvHistory, stream::*};
 
 use ::bytes::{Bytes, BytesMut};
 use ::futures::{
@@ -25,6 +26,7 @@ use ::tokio::{
     task::JoinHandle,
 };
 use ::tokio_util::{codec::BytesCodec, sync::CancellationToken, udp::UdpFramed};
+use std::time::Duration;
 
 pub struct KcpUdpStream {
     config: Arc<KcpConfig>,
@@ -38,15 +40,17 @@ impl KcpUdpStream {
         config: Arc<KcpConfig>,
         addr: A,
         backlog: usize,
+        conv_history: Option<ConvHistory>,
     ) -> io::Result<Self> {
         let udp = UdpSocket::bind(addr).await?;
-        Self::socket_listen(config, udp, backlog)
+        Self::socket_listen(config, udp, backlog, conv_history)
     }
 
     pub fn socket_listen(
         config: Arc<KcpConfig>,
         udp: UdpSocket,
         backlog: usize,
+        conv_history: Option<ConvHistory>,
     ) -> io::Result<Self> {
         let token = CancellationToken::new();
         let backlog = backlog.max(8);
@@ -56,6 +60,7 @@ impl KcpUdpStream {
         let task = Task::new(
             config.clone(),
             backlog,
+            conv_history,
             stream_tx,
             msg_tx,
             pkt_tx,
@@ -162,6 +167,7 @@ enum Message {
 struct Task {
     config: Arc<KcpConfig>,
     backlog: usize,
+    conv_history: ConvHistory,
     stream_tx: Sender<(KcpStream, SocketAddr)>,
     msg_tx: UnboundedSender<Message>,
     pkt_tx: UnboundedSender<(Bytes, SocketAddr)>,
@@ -179,6 +185,7 @@ impl Task {
     fn new(
         config: Arc<KcpConfig>,
         backlog: usize,
+        conv_history: Option<ConvHistory>,
         stream_tx: Sender<(KcpStream, SocketAddr)>,
         msg_tx: UnboundedSender<Message>,
         pkt_tx: UnboundedSender<(Bytes, SocketAddr)>,
@@ -187,6 +194,8 @@ impl Task {
         Self {
             config,
             backlog,
+            conv_history: conv_history
+                .unwrap_or_else(|| ConvHistory::new(0, Duration::from_secs(120))),
             stream_tx,
             msg_tx,
             pkt_tx,
@@ -296,7 +305,7 @@ impl Task {
             #[allow(clippy::never_loop)]
             let session = loop {
                 // Find session by conv.
-                let pkt_conv = match KcpStream::read_conv(packet) {
+                let pkt_conv = match Kcp::read_conv(packet) {
                     Some(x) => x,
                     _ => break None,
                 };
@@ -312,15 +321,13 @@ impl Task {
                 };
 
                 let conv = if let Some(&conv) = self.sid_map.get(session_id) {
-                    if conv != pkt_conv && pkt_conv != KcpStream::SYN_CONV {
+                    if conv != pkt_conv && pkt_conv != Kcp::SYN_CONV {
                         // conv is inconsistent.
                         break None;
                     }
                     conv
                 } else {
-                    if pkt_conv != KcpStream::SYN_CONV
-                        || session_id.len() != self.config.session_id_len
-                    {
+                    if pkt_conv != Kcp::SYN_CONV || session_id.len() != self.config.session_id_len {
                         // It's not a SYN handshake packet.
                         break None;
                     }
@@ -331,13 +338,10 @@ impl Task {
                         _ => break None,
                     };
 
-                    // TODO: new conv
-                    let conv = loop {
-                        let x = KcpStream::rand_conv();
-                        if !self.conv_map.contains_key(&x) {
-                            break x;
-                        }
-                    };
+                    // New KCP conv.
+                    let conv = self
+                        .conv_history
+                        .allocate(|x| self.conv_map.contains_key(x));
 
                     let (sender, receiver) = channel(self.config.snd_wnd as usize);
                     let token = self.token.child_token();
@@ -406,6 +410,7 @@ impl Task {
     }
 
     async fn remove_session(&mut self, mut session: Session) {
+        self.conv_history.add(session.conv);
         self.sid_map.remove(&session.session_id);
         if let Some(task) = session.task.take() {
             self.accept_task_count -= 1;

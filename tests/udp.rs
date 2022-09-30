@@ -3,7 +3,7 @@
 async fn test_udp_stream() {
     use ::bytes::Bytes;
     use ::futures::{SinkExt, StreamExt};
-    use ::kcp::udp::*;
+    use ::kcp::*;
     use ::log::info;
     use ::std::{sync::Arc, time::Duration};
     use ::tokio::select;
@@ -21,7 +21,7 @@ async fn test_udp_stream() {
     });
 
     let server_addr = "127.0.0.1:4323";
-    let mut server = KcpUdpStream::listen(config.clone(), server_addr, 8)
+    let mut server = KcpUdpStream::listen(config.clone(), server_addr, 8, None)
         .await
         .unwrap();
 

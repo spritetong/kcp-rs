@@ -73,6 +73,8 @@ pub struct KcpConfig {
     pub stream: bool,
     /// Connect timeout, default is 15 seconds
     pub connect_timeout: Duration,
+    /// Shutdown timeout, default is 10 seconds
+    pub shutdown_timeout: Duration,
     /// Session key
     pub session_key: Bytes,
     /// Length of session ID
@@ -90,6 +92,7 @@ impl Default for KcpConfig {
             rcv_wnd: 256,
             stream: true,
             connect_timeout: Duration::from_secs(15),
+            shutdown_timeout: Duration::from_secs(10),
             session_key: Bytes::new(),
             session_id_len: 16,
             session_expire: Duration::from_secs(90),

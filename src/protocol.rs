@@ -220,9 +220,10 @@ impl Kcp {
             ikcp_wndsize(self.as_mut(), sndwnd as c_int, rcvwnd as c_int);
         }
     }
+}
 
-    ////////////////////////////////////////////////////////////////////////////
 
+impl Kcp {
     export_fields! { conv, current, nsnd_que, nrcv_que, nrcv_buf }
 
     pub fn duration_since(&self, since: u32) -> u32 {
@@ -327,6 +328,27 @@ impl Kcp {
             }
         }
         None
+    }
+}
+
+impl Kcp {
+    /// The conv used for SYN handshake.
+    pub const SYN_CONV: u32 = 0xFFFF_FFFE;
+
+    /// Check if a conv is valid.
+    #[inline]
+    pub fn is_valid_conv(conv: u32) -> bool {
+        conv != 0 && conv < Self::SYN_CONV
+    }
+
+    /// Generate a random conv.
+    pub fn rand_conv() -> u32 {
+        loop {
+            let conv = rand::random();
+            if Self::is_valid_conv(conv) {
+                break conv;
+            }
+        }
     }
 
     /// Maximum size of a data frame.
