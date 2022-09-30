@@ -32,7 +32,7 @@ use ::tokio_util::sync::{CancellationToken, PollSender};
 
 macro_rules! debug {
     ($($x:expr),* $(,)?) => {
-        log::debug!($($x),*)
+        //log::debug!($($x),*)
     };
 }
 
