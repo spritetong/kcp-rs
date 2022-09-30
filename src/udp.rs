@@ -4,7 +4,7 @@ use crate::transport::*;
 use ::bytes::{Bytes, BytesMut};
 use ::futures::{
     future::{poll_fn, ready},
-    SinkExt, Stream, StreamExt,
+    Sink, SinkExt, Stream, StreamExt,
 };
 use ::hashlink::LinkedHashMap;
 use ::std::{
@@ -18,15 +18,13 @@ use ::std::{
 use ::tokio::{
     net::{lookup_host, ToSocketAddrs, UdpSocket},
     select,
-    sync::mpsc::{channel, unbounded_channel, Receiver, Sender, UnboundedSender},
+    sync::mpsc::{
+        channel, unbounded_channel, OwnedPermit, Receiver, Sender, UnboundedReceiver,
+        UnboundedSender,
+    },
     task::JoinHandle,
 };
-use ::tokio_util::{
-    codec::BytesCodec,
-    sync::{CancellationToken, PollSendError, PollSender},
-    udp::UdpFramed,
-};
-use tokio::sync::mpsc::UnboundedReceiver;
+use ::tokio_util::{codec::BytesCodec, sync::CancellationToken, udp::UdpFramed};
 
 pub struct KcpUdpStream {
     config: Arc<KcpConfig>,
@@ -53,7 +51,7 @@ impl KcpUdpStream {
         let token = CancellationToken::new();
         let backlog = backlog.max(8);
         let (stream_tx, stream_rx) = channel(backlog);
-        let (msg_tx, msg_rx) = channel(backlog);
+        let (msg_tx, msg_rx) = unbounded_channel();
         let (pkt_tx, pkt_rx) = unbounded_channel();
         let task = Task::new(
             config.clone(),
@@ -151,6 +149,7 @@ struct Session {
     session_id: Bytes,
     peer_addr: SocketAddr,
     sender: Sender<BytesMut>,
+    stream_permit: Option<OwnedPermit<(KcpStream, SocketAddr)>>,
     token: CancellationToken,
     task: Option<JoinHandle<()>>,
 }
@@ -164,7 +163,7 @@ struct Task {
     config: Arc<KcpConfig>,
     backlog: usize,
     stream_tx: Sender<(KcpStream, SocketAddr)>,
-    msg_tx: Sender<Message>,
+    msg_tx: UnboundedSender<Message>,
     pkt_tx: UnboundedSender<(Bytes, SocketAddr)>,
     token: CancellationToken,
 
@@ -181,7 +180,7 @@ impl Task {
         config: Arc<KcpConfig>,
         backlog: usize,
         stream_tx: Sender<(KcpStream, SocketAddr)>,
-        msg_tx: Sender<Message>,
+        msg_tx: UnboundedSender<Message>,
         pkt_tx: UnboundedSender<(Bytes, SocketAddr)>,
         token: CancellationToken,
     ) -> Self {
@@ -202,7 +201,7 @@ impl Task {
     async fn run(
         mut self,
         udp: UdpSocket,
-        mut msg_rx: Receiver<Message>,
+        mut msg_rx: UnboundedReceiver<Message>,
         mut pkt_rx: UnboundedReceiver<(Bytes, SocketAddr)>,
     ) {
         let (mut udp_sink, mut udp_stream) = UdpFramed::new(udp, BytesCodec::new()).split();
@@ -240,10 +239,8 @@ impl Task {
                                     self.accept_task_count -= 1;
                                     let _ = task.await;
                                 }
-                                // TODO:
-                                select! {
-                                    _ = self.stream_tx.send((stream, session.peer_addr)) => (),
-                                    _ = token.cancelled() => (),
+                                if let Some(permit) = session.stream_permit.take() {
+                                    permit.send((stream, session.peer_addr));
                                 }
                             }
                         }
@@ -258,15 +255,7 @@ impl Task {
                 Some(item) = pkt_rx.recv() => {
                     let _ = udp_sink.feed(item).await;
                     // Try send more.
-                    for _ in 0..Self::PACKET_QUEUE_LOOP {
-                        match pkt_rx.try_recv() {
-                            Ok(item) => {
-                                let _ = udp_sink.feed(item).await;
-                            },
-                            _ => break,
-                        }
-                    }
-                    let _ = udp_sink.flush().await;
+                    Self::send_pending_packets(&mut pkt_rx, &mut udp_sink, Self::PACKET_QUEUE_LOOP).await;
                 }
 
                 _ = token.cancelled() => break,
@@ -274,12 +263,31 @@ impl Task {
         }
 
         msg_rx.close();
-        pkt_rx.close();
+        Self::send_pending_packets(&mut pkt_rx, &mut udp_sink, usize::MAX).await;
 
         // Close all sessions.
         while let Some((_, session)) = self.conv_map.pop_front() {
             self.remove_session(session).await;
         }
+
+        pkt_rx.close();
+        Self::send_pending_packets(&mut pkt_rx, &mut udp_sink, usize::MAX).await;
+    }
+
+    async fn send_pending_packets<S: Sink<(Bytes, SocketAddr)> + Unpin>(
+        pkt_rx: &mut UnboundedReceiver<(Bytes, SocketAddr)>,
+        udp_sink: &mut S,
+        max: usize,
+    ) {
+        for _ in 0..max {
+            match pkt_rx.try_recv() {
+                Ok(item) => {
+                    let _ = udp_sink.feed(item).await;
+                }
+                _ => break,
+            }
+        }
+        let _ = udp_sink.flush().await;
     }
 
     /// This function is cancel-safe.
@@ -316,12 +324,12 @@ impl Task {
                         // It's not a SYN handshake packet.
                         break None;
                     }
-                    if self.stream_tx.try_reserve().is_err()
-                        || self.accept_task_count >= self.backlog
-                    {
-                        // TODO: No space to store a new connection.
-                        break None;
-                    }
+
+                    // Get permit for the backlog limitation.
+                    let stream_permit = match self.stream_tx.clone().try_reserve_owned() {
+                        Ok(x) => x,
+                        _ => break None,
+                    };
 
                     // TODO: new conv
                     let conv = loop {
@@ -344,6 +352,7 @@ impl Task {
                             peer_addr: *peer_addr,
                             sender,
                             token: token.clone(),
+                            stream_permit: Some(stream_permit),
                             task: Some(tokio::spawn(Self::accept_stream(
                                 self.config.clone(),
                                 conv,
@@ -378,11 +387,11 @@ impl Task {
         peer_addr: SocketAddr,
         receiver: Receiver<BytesMut>,
         pkt_tx: UnboundedSender<(Bytes, SocketAddr)>,
-        msg_tx: Sender<Message>,
+        msg_tx: UnboundedSender<Message>,
         token: CancellationToken,
     ) {
-        let disconnect = PollSender::new(msg_tx.clone())
-            .with(move |conv: u32| ready(Ok::<_, PollSendError<_>>(Message::Disconnect { conv })));
+        let disconnect = UnboundedSink::new(msg_tx.clone())
+            .with(move |conv: u32| ready(Ok::<_, io::Error>(Message::Disconnect { conv })));
         if let Ok(stream) = KcpStream::accept(
             config,
             conv,
@@ -392,7 +401,7 @@ impl Task {
         )
         .await
         {
-            let _ = msg_tx.send(Message::Connect(stream)).await;
+            let _ = msg_tx.send(Message::Connect(stream));
         }
     }
 

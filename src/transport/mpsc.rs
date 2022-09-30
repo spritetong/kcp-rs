@@ -1,9 +1,10 @@
 use futures::{Sink, SinkExt, Stream};
 use std::{
+    io,
     pin::Pin,
     task::{Context, Poll},
 };
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender};
 use tokio_util::sync::PollSender;
 
 pub struct MpscTransport<S, R> {
@@ -82,5 +83,68 @@ where
     #[inline]
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.stream.poll_recv(cx)
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+pub struct UnboundedSink<T>(Option<UnboundedSender<T>>);
+
+impl<T> UnboundedSink<T> {
+    pub fn new(sender: UnboundedSender<T>) -> Self {
+        Self(Some(sender))
+    }
+
+    #[inline]
+    pub fn get_ref(&self) -> &Option<UnboundedSender<T>> {
+        &self.0
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self) -> &mut Option<UnboundedSender<T>> {
+        &mut self.0
+    }
+
+    #[inline]
+    pub fn into_inner(self) -> Option<UnboundedSender<T>> {
+        self.0
+    }
+}
+
+impl<T> Sink<T> for UnboundedSink<T> {
+    type Error = io::Error;
+
+    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        if self.0.is_some() {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Ready(Err(io::ErrorKind::NotConnected.into()))
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        if self.0.is_some() {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Ready(Err(io::ErrorKind::NotConnected.into()))
+        }
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: T) -> Result<(), Self::Error> {
+        if let Some(sender) = &self.0 {
+            sender
+                .send(item)
+                .map_err(|_| io::ErrorKind::NotConnected.into())
+        } else {
+            Err(io::ErrorKind::NotConnected.into())
+        }
+    }
+
+    fn poll_close(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        self.0.take();
+        Poll::Ready(Ok(()))
     }
 }

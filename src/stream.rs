@@ -12,7 +12,7 @@ use ::std::{
     ops::Deref,
     pin::Pin,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU32, Ordering},
         Arc,
     },
     task::{Context, Poll},
@@ -28,6 +28,12 @@ use ::tokio::{
     task::JoinHandle,
 };
 use ::tokio_util::sync::{CancellationToken, PollSender};
+
+macro_rules! debug {
+    ($($x:expr),* $(,)?) => {
+        //log::debug!($($x),*)
+    };
+}
 
 pub struct KcpStream {
     config: Arc<KcpConfig>,
@@ -383,6 +389,22 @@ impl Task {
     const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 }
 
+impl std::fmt::Display for Task {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}({}, {:?})",
+            if self.is_client() {
+                "Connect"
+            } else {
+                "Accept"
+            },
+            self.kcp.conv(),
+            self.hs
+        )
+    }
+}
+
 impl Task {
     async fn run<T, Si, D>(mut self, output_tx: Sender<Output>, mut transport: T, mut disconnect: D)
     where
@@ -465,7 +487,7 @@ impl Task {
                         _ => closed = true,
                     }
                     if closed {
-                        log::debug!("({}) Input channel closed, starting FIN handshake", self.is_client());
+                        debug!("{} input channel has been closed, start FIN handshake", &self);
                         self.flags |= Self::INPUT_CLOSED;
                         self.fin_transite_state();
                     }
@@ -535,30 +557,23 @@ impl Task {
             }
         }
 
-        log::debug!("({}) break loop", self.is_client());
+        debug!("{} break loop", &self);
 
         tx_frame.take();
         drop(output_tx);
         self.input_rx.close();
         while self.input_rx.recv().await.is_some() {}
 
-        // TODO: send RESET packet.
         if KcpStream::is_valid_conv(self.kcp.conv()) {
             let mut buf = BytesMut::new();
             self.kcp.write_ack_head(&mut buf, Self::KCP_RESET, 0);
-            SHUTDOWN_POOL.create_task(Box::new(ShutdownSink::new(transport)), buf);
+            SHUTDOWN_POOL
+                .create_task(Box::new(ShutdownSink::new(transport)), buf)
+                .await;
         }
 
         // Report disconnect.
-        if tokio::time::timeout(Self::DISCONNECT_TIMEOUT, disconnect.send(self.kcp.conv()))
-            .await
-            .is_err()
-        {
-            error!(
-                "timeout to send disonnect message, conv {}",
-                self.kcp.conv()
-            );
-        }
+        disconnect.send(self.kcp.conv()).await.ok();
     }
 
     #[inline]
@@ -656,7 +671,7 @@ impl Task {
 
     #[inline]
     fn set_handshake(&mut self, hs: Handshake) {
-        log::debug!("({}) {:?} -> {:?}", self.is_client(), self.hs, hs);
+        debug!("{} -> {:?}", self, hs);
         self.hs = hs;
     }
 
@@ -670,10 +685,9 @@ impl Task {
                     Handshake::FinPending
                 }
                 Handshake::FinPending => {
-                    log::debug!(
-                        "({}) in {:?}, input closed: {}, waitsnd: {}",
-                        self.is_client(),
-                        self.hs,
+                    debug!(
+                        "{} input closed: {}, waitsnd: {}",
+                        &self,
                         self.has(Self::INPUT_CLOSED),
                         self.kcp.get_waitsnd()
                     );
@@ -684,22 +698,16 @@ impl Task {
                     Handshake::FinSent
                 }
                 Handshake::FinSent => {
-                    log::debug!(
-                        "({}) in {:?}, waitsnd: {}",
-                        self.is_client(),
-                        self.hs,
-                        self.kcp.get_waitsnd()
-                    );
+                    debug!("{} waitsnd: {}", self, self.kcp.get_waitsnd());
                     if self.kcp.get_waitsnd() > 0 {
                         break;
                     }
                     Handshake::FinWaitPeer
                 }
                 Handshake::FinWaitPeer => {
-                    log::debug!(
-                        "({}) in {:?}, waitsnd: {} + {}",
-                        self.is_client(),
-                        self.hs,
+                    debug!(
+                        "{} waitsnd: {} + {}",
+                        self,
                         self.kcp.nrcv_que(),
                         self.kcp.nrcv_buf(),
                     );
@@ -761,7 +769,7 @@ impl Task {
             // Check the session key and ID of the FIN frame.
             if let Some(fin) = self.kcp.recv_bytes() {
                 if Some(&self.session_id[..]) == fin.strip_prefix(self.config.session_key.deref()) {
-                    log::debug!("({}) Receive FIN frame", self.is_client());
+                    debug!("{} receive FIN frame", self);
                 }
             }
             None
@@ -789,15 +797,15 @@ impl Task {
                         return;
                     }
                     trace!(
-                        "conv does not match: {} != {}",
+                        "{} conv does not match: {}",
+                        self,
                         Kcp::read_conv(&self.rx_buf).unwrap_or(0),
-                        self.kcp.conv()
                     );
                 }
                 io::ErrorKind::InvalidData => {
                     let cmd = Kcp::read_cmd(&packet);
                     if cmd & Self::KCP_RESET != 0 {
-                        log::debug!("({}) receive RESET", self.is_client());
+                        debug!("{} receive RESET", self);
                         self.set_handshake(Handshake::Disconnected);
                         return;
                     }
@@ -853,7 +861,7 @@ static SHUTDOWN_POOL: Lazy<ShutdownPool> = Lazy::new(ShutdownPool::new);
 struct ShutdownPool {
     token: CancellationToken,
     notify: Arc<Notify>,
-    task_count: Arc<AtomicUsize>,
+    task_count: Arc<AtomicU32>,
 }
 
 struct ShutdownTask {
@@ -861,34 +869,38 @@ struct ShutdownTask {
     reset_packet: BytesMut,
     token: CancellationToken,
     notify: Arc<Notify>,
-    counter: Arc<AtomicUsize>,
+    counter: Arc<AtomicU32>,
 }
 
 impl Drop for ShutdownTask {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::Acquire);
+        self.counter.fetch_sub(1, Ordering::Relaxed);
         self.notify.notify_one();
     }
 }
 
 impl ShutdownTask {
     async fn run(mut self) {
-        for _ in 0..5 {
+        for _ in 0..(5 - 1) {
             select! {
-                x = self.sink.send(self.reset_packet.clone()) => {
-                    if x.is_err() {
+                biased;
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    if self.send().await.is_err() {
                         break;
                     }
-                }
+                },
                 _ = self.token.cancelled() => break,
             }
-            if tokio::time::timeout(Duration::from_secs(1), self.token.cancelled())
-                .await
-                .is_ok()
-            {
-                break;
-            }
         }
+    }
+
+    async fn send(&mut self) -> io::Result<()> {
+        select! {
+            biased;
+            x = self.sink.send(self.reset_packet.clone()) => x?,
+            _ = self.token.cancelled() => return Err(io::ErrorKind::NotConnected.into()),
+        }
+        Ok(())
     }
 }
 
@@ -897,36 +909,40 @@ impl ShutdownPool {
         Self {
             token: CancellationToken::new(),
             notify: Arc::new(Notify::new()),
-            task_count: Arc::new(AtomicUsize::new(0)),
+            task_count: Arc::new(AtomicU32::new(0)),
         }
     }
 
-    fn create_task(
+    async fn create_task(
         &self,
         sink: Box<dyn Sink<BytesMut, Error = io::Error> + Send + Unpin>,
         reset_packet: BytesMut,
     ) {
-        let token = self.token.child_token();
-        if self.token.is_cancelled() {
+        // Create task.
+        let mut task = ShutdownTask {
+            sink,
+            reset_packet,
+            token: self.token.child_token(),
+            notify: self.notify.clone(),
+            counter: self.task_count.clone(),
+        };
+        task.counter.fetch_add(1, Ordering::Relaxed);
+
+        // Send the reset packet directly.
+        if task.send().await.is_err() {
             return;
         }
 
-        self.task_count.fetch_add(1, Ordering::Release);
-        tokio::spawn(
-            ShutdownTask {
-                sink,
-                reset_packet,
-                token,
-                notify: self.notify.clone(),
-                counter: self.task_count.clone(),
-            }
-            .run(),
-        );
+        if self.token.is_cancelled() {
+            warn!("The KCP stream shutdown pool has been shut down.");
+            return;
+        }
+        tokio::spawn(task.run());
     }
 
-    async fn cleanup(&self) {
+    async fn shutdown(&self) {
         self.token.cancel();
-        while self.task_count.load(Ordering::Acquire) > 0 {
+        while self.task_count.load(Ordering::Relaxed) > 0 {
             self.notify.notified().await;
         }
     }
@@ -978,10 +994,6 @@ where
     }
 }
 
-pub fn kcp_initialize() {
-    let _ = SHUTDOWN_POOL.deref();
-}
-
-pub async fn kcp_cleanup() {
-    SHUTDOWN_POOL.cleanup().await;
+pub async fn kcp_sys_shutdown() {
+    SHUTDOWN_POOL.shutdown().await;
 }

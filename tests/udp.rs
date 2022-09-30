@@ -13,7 +13,6 @@ async fn test_udp_stream() {
         .is_test(true)
         .try_init()
         .ok();
-    kcp_initialize();
 
     let config = Arc::new(KcpConfig {
         nodelay: KcpNoDelayConfig::fastest(),
@@ -74,5 +73,5 @@ async fn test_udp_stream() {
     s1.close().await.unwrap();
     s2.close().await.unwrap();
     server.close().await.unwrap();
-    kcp_cleanup().await;
+    kcp_sys_shutdown().await;
 }

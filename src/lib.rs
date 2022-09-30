@@ -11,7 +11,7 @@ pub mod transport;
 #[cfg(feature = "stream")]
 pub mod stream;
 #[cfg(feature = "stream")]
-pub use crate::stream::{kcp_cleanup, kcp_initialize, KcpStream};
+pub use crate::stream::{kcp_sys_shutdown, KcpStream};
 
 #[cfg(feature = "udp")]
 pub mod udp;
