@@ -1,15 +1,14 @@
 use crate::protocol::Kcp;
 use crate::transport::*;
-use crate::{conv::ConvHistory, stream::*};
+use crate::{conv::ConvCache, stream::*};
 
 use ::bytes::{Bytes, BytesMut};
 use ::futures::{
-    future::{poll_fn, ready},
+    future::{poll_immediate, ready},
     Sink, SinkExt, Stream, StreamExt,
 };
 use ::hashlink::LinkedHashMap;
 use ::std::{
-    collections::VecDeque,
     io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
@@ -26,7 +25,6 @@ use ::tokio::{
     task::JoinHandle,
 };
 use ::tokio_util::{codec::BytesCodec, sync::CancellationToken, udp::UdpFramed};
-use std::time::Duration;
 
 pub struct KcpUdpStream {
     config: Arc<KcpConfig>,
@@ -40,37 +38,26 @@ impl KcpUdpStream {
         config: Arc<KcpConfig>,
         addr: A,
         backlog: usize,
-        conv_history: Option<ConvHistory>,
+        conv_cache: Option<ConvCache>,
     ) -> io::Result<Self> {
         let udp = UdpSocket::bind(addr).await?;
-        Self::socket_listen(config, udp, backlog, conv_history)
+        Self::socket_listen(config, udp, backlog, conv_cache)
     }
 
     pub fn socket_listen(
         config: Arc<KcpConfig>,
         udp: UdpSocket,
         backlog: usize,
-        conv_history: Option<ConvHistory>,
+        conv_cache: Option<ConvCache>,
     ) -> io::Result<Self> {
         let token = CancellationToken::new();
-        let backlog = backlog.max(8);
-        let (stream_tx, stream_rx) = channel(backlog);
-        let (msg_tx, msg_rx) = unbounded_channel();
-        let (pkt_tx, pkt_rx) = unbounded_channel();
-        let task = Task::new(
-            config.clone(),
-            backlog,
-            conv_history,
-            stream_tx,
-            msg_tx,
-            pkt_tx,
-            token.clone(),
-        );
+        let (stream_tx, stream_rx) = channel(backlog.max(8));
+        let task = Task::new(config.clone(), conv_cache, stream_tx, token.clone());
         Ok(Self {
             config,
             stream_rx,
             token,
-            task: Some(tokio::spawn(task.run(udp, msg_rx, pkt_rx))),
+            task: Some(tokio::spawn(task.run(udp))),
         })
     }
 
@@ -166,86 +153,78 @@ enum Message {
 
 struct Task {
     config: Arc<KcpConfig>,
-    backlog: usize,
-    conv_history: ConvHistory,
+    conv_cache: ConvCache,
     stream_tx: Sender<(KcpStream, SocketAddr)>,
     msg_tx: UnboundedSender<Message>,
+    msg_rx: UnboundedReceiver<Message>,
     pkt_tx: UnboundedSender<(Bytes, SocketAddr)>,
+    pkt_rx: UnboundedReceiver<(Bytes, SocketAddr)>,
     token: CancellationToken,
 
-    rx_queue: VecDeque<(BytesMut, SocketAddr)>,
     conv_map: LinkedHashMap<u32, Session>,
     sid_map: LinkedHashMap<Bytes, u32>,
-    accept_task_count: usize,
 }
 
 impl Task {
-    const PACKET_QUEUE_LOOP: usize = 1024;
-
     fn new(
         config: Arc<KcpConfig>,
-        backlog: usize,
-        conv_history: Option<ConvHistory>,
+        conv_cache: Option<ConvCache>,
         stream_tx: Sender<(KcpStream, SocketAddr)>,
-        msg_tx: UnboundedSender<Message>,
-        pkt_tx: UnboundedSender<(Bytes, SocketAddr)>,
         token: CancellationToken,
     ) -> Self {
+        let (msg_tx, msg_rx) = unbounded_channel();
+        let (pkt_tx, pkt_rx) = unbounded_channel();
         Self {
             config,
-            backlog,
-            conv_history: conv_history
-                .unwrap_or_else(|| ConvHistory::new(0, Duration::from_secs(120))),
+            conv_cache: conv_cache.unwrap_or_else(|| ConvCache::new(0, LISTENER_CONV_TIMEOUT)),
             stream_tx,
             msg_tx,
+            msg_rx,
             pkt_tx,
+            pkt_rx,
             token,
-            rx_queue: VecDeque::with_capacity(Self::PACKET_QUEUE_LOOP),
             conv_map: LinkedHashMap::new(),
             sid_map: LinkedHashMap::new(),
-            accept_task_count: 0,
         }
     }
 
-    async fn run(
-        mut self,
-        udp: UdpSocket,
-        mut msg_rx: UnboundedReceiver<Message>,
-        mut pkt_rx: UnboundedReceiver<(Bytes, SocketAddr)>,
-    ) {
-        let (mut udp_sink, mut udp_stream) = UdpFramed::new(udp, BytesCodec::new()).split();
-        let token = self.token.clone();
+    async fn run(mut self, udp: UdpSocket) {
+        let mut transport = UdpFramed::new(udp, BytesCodec::new());
 
-        loop {
+        'outer: loop {
             select! {
-                Some(x) = udp_stream.next(), if self.rx_queue.is_empty() => {
-                    if let Ok(x) = x {
-                        self.rx_queue.push_back(x);
-                    }
-                    // Try to receive more.
-                    poll_fn(|cx| {
-                        for _ in 0..self.rx_queue.capacity() - self.rx_queue.len() {
-                            match udp_stream.poll_next_unpin(cx) {
-                                Poll::Ready(Some(x)) => {
-                                    if let Ok(x) = x {
-                                        self.rx_queue.push_back(x);
-                                    }
+                x = transport.next() => {
+                    let mut recved = x;
+                    for _ in 0..LISTENER_TASK_LOOP {
+                        match recved {
+                            Some(Ok((packet, addr))) => {
+                                if let Some(session) = self.get_session(&packet, &addr) {
+                                    let _ = session.sender.send(packet.clone()).await;
                                 }
-                                _ => break,
                             }
+                            Some(Err(_)) => break,
+                            None => break 'outer,
                         }
-                        Poll::Ready(())
-                    }).await;
+
+                        // Try to receive more.
+                        match poll_immediate(transport.next()).await {
+                            Some(x) => recved = x,
+                            _ => break,
+                        }
+                    }
                 }
 
-                _ = self.recv_packet(), if !self.rx_queue.is_empty() => (),
+                Some(item) = self.pkt_rx.recv() => {
+                    let _ = transport.feed(item).await;
+                    // Try send more.
+                    self.try_send(&mut transport, LISTENER_TASK_LOOP).await;
+                }
 
-                Some(msg) = msg_rx.recv() => {
+                Some(msg) = self.msg_rx.recv() => {
                     match msg {
                         Message::Connect(stream) => {
                             if let Some(session) = self.conv_map.get_mut(&stream.conv()) {
                                 if let Some(task) = session.task.take() {
-                                    self.accept_task_count -= 1;
                                     let _ = task.await;
                                 }
                                 if let Some(permit) = session.stream_permit.take() {
@@ -255,133 +234,109 @@ impl Task {
                         }
                         Message::Disconnect { conv } => {
                             if let Some(session) = self.conv_map.remove(&conv) {
-                                self.remove_session(session).await;
+                                self.kill_session(session).await;
                             }
                         }
                     }
                 }
 
-                Some(item) = pkt_rx.recv() => {
-                    let _ = udp_sink.feed(item).await;
-                    // Try send more.
-                    Self::send_pending_packets(&mut pkt_rx, &mut udp_sink, Self::PACKET_QUEUE_LOOP).await;
-                }
-
-                _ = token.cancelled() => break,
+                _ = self.token.cancelled() => break,
             }
         }
 
-        msg_rx.close();
-        Self::send_pending_packets(&mut pkt_rx, &mut udp_sink, usize::MAX).await;
+        self.msg_rx.close();
+        self.token.cancel();
+        self.try_send(&mut transport, usize::MAX).await;
 
         // Close all sessions.
         while let Some((_, session)) = self.conv_map.pop_front() {
-            self.remove_session(session).await;
+            self.kill_session(session).await;
+            self.try_send(&mut transport, usize::MAX).await;
         }
 
-        pkt_rx.close();
-        Self::send_pending_packets(&mut pkt_rx, &mut udp_sink, usize::MAX).await;
+        self.pkt_rx.close();
+        self.try_send(&mut transport, usize::MAX).await;
     }
 
-    async fn send_pending_packets<S: Sink<(Bytes, SocketAddr)> + Unpin>(
-        pkt_rx: &mut UnboundedReceiver<(Bytes, SocketAddr)>,
-        udp_sink: &mut S,
-        max: usize,
-    ) {
+    async fn try_send<S: Sink<(Bytes, SocketAddr)> + Unpin>(&mut self, sink: &mut S, max: usize) {
         for _ in 0..max {
-            match pkt_rx.try_recv() {
+            match self.pkt_rx.try_recv() {
                 Ok(item) => {
-                    let _ = udp_sink.feed(item).await;
+                    let _ = sink.feed(item).await;
                 }
                 _ => break,
             }
         }
-        let _ = udp_sink.flush().await;
+        let _ = sink.flush().await;
     }
 
-    /// This function is cancel-safe.
-    async fn recv_packet(&mut self) {
-        while let Some((packet, peer_addr)) = self.rx_queue.front() {
-            #[allow(clippy::never_loop)]
-            let session = loop {
-                // Find session by conv.
-                let pkt_conv = match Kcp::read_conv(packet) {
-                    Some(x) => x,
-                    _ => break None,
-                };
-                if let x @ Some(_) = self.conv_map.get(&pkt_conv) {
-                    break x;
-                }
+    /// Get session by a received packet.
+    fn get_session(&mut self, packet: &[u8], peer_addr: &SocketAddr) -> Option<&Session> {
+        // Find session by conv.
+        let pkt_conv = match Kcp::read_conv(packet) {
+            Some(x) => match self.conv_map.get(&x) {
+                Some(s) if &s.peer_addr == peer_addr => return self.conv_map.get(&x),
+                Some(_) => return None,
+                _ => x,
+            },
+            _ => return None,
+        };
 
-                // Try to accept a new connection.
-                let session_id = match KcpStream::read_session_id(packet, &self.config.session_key)
-                {
-                    Some(x) => x,
-                    _ => break None,
-                };
+        // Try to accept a new connection.
+        let session_id = match KcpStream::read_session_id(packet, &self.config.session_key) {
+            Some(x) => x,
+            _ => return None,
+        };
 
-                let conv = if let Some(&conv) = self.sid_map.get(session_id) {
-                    if conv != pkt_conv && pkt_conv != Kcp::SYN_CONV {
-                        // conv is inconsistent.
-                        break None;
-                    }
-                    conv
-                } else {
-                    if pkt_conv != Kcp::SYN_CONV || session_id.len() != self.config.session_id_len {
-                        // It's not a SYN handshake packet.
-                        break None;
-                    }
-
-                    // Get permit for the backlog limitation.
-                    let stream_permit = match self.stream_tx.clone().try_reserve_owned() {
-                        Ok(x) => x,
-                        _ => break None,
-                    };
-
-                    // New KCP conv.
-                    let conv = self
-                        .conv_history
-                        .allocate(|x| self.conv_map.contains_key(x));
-
-                    let (sender, receiver) = channel(self.config.snd_wnd as usize);
-                    let token = self.token.child_token();
-
-                    let session_id = Bytes::copy_from_slice(session_id);
-                    self.sid_map.insert(session_id.clone(), conv);
-                    self.conv_map.insert(
-                        conv,
-                        Session {
-                            conv,
-                            session_id,
-                            peer_addr: *peer_addr,
-                            sender,
-                            token: token.clone(),
-                            stream_permit: Some(stream_permit),
-                            task: Some(tokio::spawn(Self::accept_stream(
-                                self.config.clone(),
-                                conv,
-                                *peer_addr,
-                                receiver,
-                                self.pkt_tx.clone(),
-                                self.msg_tx.clone(),
-                                token,
-                            ))),
-                        },
-                    );
-                    self.accept_task_count += 1;
-                    conv
-                };
-                break self.conv_map.get(&conv);
-            };
-
-            // Remove the packet.
-            if let Some(session) = session {
-                if &session.peer_addr == peer_addr {
-                    let _ = session.sender.send(packet.clone()).await;
+        if let Some(&conv) = self.sid_map.get(session_id) {
+            if conv == pkt_conv || pkt_conv == Kcp::SYN_CONV {
+                match self.conv_map.get(&conv) {
+                    x @ Some(s) if &s.peer_addr == peer_addr => return x,
+                    _ => (),
                 }
             }
+            None
+        } else {
+            if pkt_conv != Kcp::SYN_CONV || session_id.len() != self.config.session_id_len {
+                // It's not a SYN handshake packet.
+                return None;
+            }
 
-            self.rx_queue.pop_front();
+            // Get permit in the backlog limitation.
+            let stream_permit = match self.stream_tx.clone().try_reserve_owned() {
+                Ok(x) => x,
+                _ => return None,
+            };
+
+            // New KCP conv.
+            let conv = self.conv_cache.allocate(|x| self.conv_map.contains_key(x));
+
+            let (sender, receiver) = channel(self.config.snd_wnd as usize);
+            let token = self.token.child_token();
+
+            let session_id = Bytes::copy_from_slice(session_id);
+            self.sid_map.insert(session_id.clone(), conv);
+            self.conv_map.insert(
+                conv,
+                Session {
+                    conv,
+                    session_id,
+                    peer_addr: *peer_addr,
+                    sender,
+                    token: token.clone(),
+                    stream_permit: Some(stream_permit),
+                    task: Some(tokio::spawn(Self::accept_stream(
+                        self.config.clone(),
+                        conv,
+                        *peer_addr,
+                        receiver,
+                        self.pkt_tx.clone(),
+                        self.msg_tx.clone(),
+                        token,
+                    ))),
+                },
+            );
+            self.conv_map.get(&conv)
         }
     }
 
@@ -409,11 +364,11 @@ impl Task {
         }
     }
 
-    async fn remove_session(&mut self, mut session: Session) {
-        self.conv_history.add(session.conv);
+    async fn kill_session(&mut self, mut session: Session) {
+        // Add the killed conv to cache to avoid conv confliction.
+        self.conv_cache.add(session.conv);
         self.sid_map.remove(&session.session_id);
         if let Some(task) = session.task.take() {
-            self.accept_task_count -= 1;
             session.token.cancel();
             let _ = task.await;
         }

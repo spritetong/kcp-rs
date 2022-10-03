@@ -268,6 +268,11 @@ impl Kcp {
         self.output_queue.pop_front()
     }
 
+    #[inline]
+    pub fn clear_output(&mut self) {
+        self.output_queue.clear();
+    }
+
     pub fn write_ack_head(&self, buf: &mut BytesMut, cmd_flags: u8, payload_size: usize) {
         buf.reserve(IKCP_OVERHEAD as usize + payload_size);
         let kcp = self.as_ref();

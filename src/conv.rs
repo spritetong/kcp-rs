@@ -8,14 +8,14 @@ use ::std::{
 };
 
 #[derive(Clone)]
-pub struct ConvHistory(Arc<Mutex<Inner>>);
+pub struct ConvCache(Arc<Mutex<Inner>>);
 
 struct Inner {
     map: LinkedHashMap<u32, Instant>,
     timeout: Duration,
 }
 
-impl ConvHistory {
+impl ConvCache {
     pub fn new(capacity: usize, timeout: Duration) -> Self {
         Self(Arc::new(Mutex::new(Inner {
             map: if capacity == 0 {

@@ -132,12 +132,11 @@ impl<T> Sink<T> for UnboundedSink<T> {
 
     fn start_send(self: Pin<&mut Self>, item: T) -> Result<(), Self::Error> {
         if let Some(sender) = &self.0 {
-            sender
-                .send(item)
-                .map_err(|_| io::ErrorKind::NotConnected.into())
-        } else {
-            Err(io::ErrorKind::NotConnected.into())
+            if sender.send(item).is_ok() {
+                return Ok(());
+            }
         }
+        Err(io::ErrorKind::NotConnected.into())
     }
 
     fn poll_close(

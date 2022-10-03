@@ -12,7 +12,9 @@ pub mod transport;
 #[cfg(feature = "stream")]
 pub mod stream;
 #[cfg(feature = "stream")]
-pub use crate::stream::{kcp_sys_shutdown, KcpStream};
+pub use crate::stream::KcpStream;
+#[cfg(feature = "stream")]
+mod halfclose;
 
 #[cfg(feature = "udp")]
 pub mod udp;
@@ -21,3 +23,9 @@ pub use crate::udp::KcpUdpStream;
 
 #[cfg(feature = "conv")]
 pub mod conv;
+
+/// Call before system exit and all KCP connections have been closed.
+pub async fn kcp_sys_shutdown() {
+    #[cfg(feature = "stream")]
+    halfclose::HalfClosePool::shutdown().await;
+}

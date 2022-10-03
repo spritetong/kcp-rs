@@ -1,32 +1,26 @@
 pub use crate::config::*;
+use crate::halfclose::*;
 use crate::protocol::Kcp;
 
 use ::bytes::{BufMut, Bytes, BytesMut};
 use ::futures::{future::poll_fn, ready, FutureExt, Sink, SinkExt, Stream, StreamExt};
 use ::log::{error, trace, warn};
-use ::once_cell::sync::Lazy;
 use ::std::{
     fmt::Display,
     io,
     marker::PhantomData,
     ops::Deref,
     pin::Pin,
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc,
-    },
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
 use ::tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     select,
-    sync::{
-        mpsc::{channel, error::TryRecvError, Receiver, Sender},
-        Notify,
-    },
+    sync::mpsc::{channel, error::TryRecvError, Receiver, Sender},
     task::JoinHandle,
-    time::{sleep, timeout},
+    time::sleep,
 };
 use ::tokio_util::sync::{CancellationToken, PollSender};
 
@@ -363,8 +357,6 @@ impl<T, Si> Task<T, Si> {
     const KCP_FIN: u8 = 0x20;
     const KCP_RESET: u8 = 0x08;
 
-    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
-
     #[inline]
     fn is_client(&self) -> bool {
         self.flags & Self::CLIENT != 0
@@ -412,7 +404,7 @@ where
         }
 
         let mut tx_frame: Option<Bytes> = None;
-        while self.hs != Handshake::Disconnected {
+        loop {
             if self.kcp.has_ouput() {
                 select! {
                     biased;
@@ -423,11 +415,15 @@ where
                 }
             }
 
+            if self.hs == Handshake::Disconnected {
+                break;
+            }
+
             if self.kcp.is_dead_link()
                 || self.kcp.duration_since(self.last_io_time)
                     >= (self.config.session_expire.as_secs() * 1000) as u32
             {
-                // TODO:
+                // TODO: dead link
                 break;
             }
 
@@ -438,7 +434,9 @@ where
                 if timeout as i32 > 0 {
                     interval = interval.min(timeout);
                 } else {
+                    // SYN / FIN handshake is timed-out.
                     self.set_handshake(Handshake::Disconnected);
+                    continue;
                 }
             }
             if interval == 0 {
@@ -512,13 +510,12 @@ where
                                 Poll::Ready(())
                             }).await;
 
-                            // SYN handshake.
-                            if self.hs == Handshake::Syn &&
-                                    self.syn_handshake_recv(&output_tx).is_err() {
-                                self.set_handshake(Handshake::Disconnected);
-                            }
-                            // FIN handshake.
-                            if self.is_fin_handshake() {
+                            if self.hs == Handshake::Syn {
+                                if self.syn_handshake_recv(&output_tx).is_err() {
+                                    self.set_handshake(Handshake::Disconnected);
+                                }
+                            } else if self.is_fin_handshake() {
+                                // FIN handshake.
                                 self.fin_transite_state();
                             }
 
@@ -542,32 +539,23 @@ where
 
         tx_frame.take();
         drop(output_tx);
+
+        // Close and drain the input queue.
         self.input_rx.close();
         while self.input_rx.recv().await.is_some() {}
 
-        timeout(Self::SHUTDOWN_TIMEOUT, self.flush_and_shutdown(transport))
-            .await
-            .ok();
-
-        // Report disconnect.
-        disconnect.send(self.kcp.conv()).await.ok();
-    }
-
-    async fn flush_and_shutdown(&mut self, mut sink: T) {
-        self.flags |= Self::FLUSH;
-        self.kcp_flush();
-
-        Self::kcp_output(&mut self.kcp, &mut sink, self.hs)
-            .await
-            .ok();
-
-        if Kcp::is_valid_conv(self.kcp.conv()) {
+        let conv = self.kcp.conv();
+        if Kcp::is_valid_conv(conv) {
             let mut buf = BytesMut::new();
             self.kcp.write_ack_head(&mut buf, Self::KCP_RESET, 0);
-            SHUTDOWN_POOL
-                .create_task(Box::new(ShutdownSink::new(sink)), buf)
-                .await;
+            let half_close_timeout = self.config.half_close_timeout;
+            // Free the KCP context.
+            drop(self);
+            HalfClosePool::create_task(transport, buf, half_close_timeout).await;
         }
+
+        // Report disconnect.
+        disconnect.send(conv).await.ok();
     }
 
     #[inline]
@@ -829,7 +817,7 @@ where
             }
 
             if let Err(e) = sink.feed(packet.into()).await {
-                // clear all output buffers on error
+                // Clear all output buffers on errors.
                 while kcp.pop_output().is_some() {}
                 warn!("send to sink: {}", e);
                 break;
@@ -838,148 +826,4 @@ where
         sink.flush().await.map_err(|_| ())?;
         Ok(())
     }
-}
-
-////////////////////////////////////////////////////////////////////////////////
-
-static SHUTDOWN_POOL: Lazy<ShutdownPool> = Lazy::new(ShutdownPool::new);
-
-struct ShutdownPool {
-    token: CancellationToken,
-    notify: Arc<Notify>,
-    task_count: Arc<AtomicU32>,
-}
-
-struct ShutdownTask {
-    sink: Box<dyn Sink<BytesMut, Error = io::Error> + Send + Unpin>,
-    reset_packet: BytesMut,
-    token: CancellationToken,
-    notify: Arc<Notify>,
-    counter: Arc<AtomicU32>,
-}
-
-impl Drop for ShutdownTask {
-    fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::Relaxed);
-        self.notify.notify_one();
-    }
-}
-
-impl ShutdownTask {
-    async fn run(mut self) {
-        for _ in 0..(5 - 1) {
-            select! {
-                biased;
-                _ = sleep(Duration::from_secs(1)) => {
-                    if self.send().await.is_err() {
-                        break;
-                    }
-                },
-                _ = self.token.cancelled() => break,
-            }
-        }
-    }
-
-    async fn send(&mut self) -> io::Result<()> {
-        select! {
-            biased;
-            x = self.sink.send(self.reset_packet.clone()) => x?,
-            _ = self.token.cancelled() => return Err(io::ErrorKind::NotConnected.into()),
-        }
-        Ok(())
-    }
-}
-
-impl ShutdownPool {
-    fn new() -> Self {
-        Self {
-            token: CancellationToken::new(),
-            notify: Arc::new(Notify::new()),
-            task_count: Arc::new(AtomicU32::new(0)),
-        }
-    }
-
-    async fn create_task(
-        &self,
-        sink: Box<dyn Sink<BytesMut, Error = io::Error> + Send + Unpin>,
-        reset_packet: BytesMut,
-    ) {
-        // Create task.
-        let mut task = ShutdownTask {
-            sink,
-            reset_packet,
-            token: self.token.child_token(),
-            notify: self.notify.clone(),
-            counter: self.task_count.clone(),
-        };
-        task.counter.fetch_add(1, Ordering::Relaxed);
-
-        // Send the reset packet directly.
-        if task.send().await.is_err() {
-            return;
-        }
-
-        if self.token.is_cancelled() {
-            warn!("The KCP stream shutdown pool has been shut down.");
-            return;
-        }
-        tokio::spawn(task.run());
-    }
-
-    async fn shutdown(&self) {
-        self.token.cancel();
-        while self.task_count.load(Ordering::Relaxed) > 0 {
-            self.notify.notified().await;
-        }
-    }
-}
-
-struct ShutdownSink<S, Si> {
-    sink: S,
-    _phantom: PhantomData<Si>,
-}
-
-impl<S, Si> ShutdownSink<S, Si> {
-    fn new(sink: S) -> Self {
-        Self {
-            sink,
-            _phantom: PhantomData::default(),
-        }
-    }
-}
-
-impl<S, Si> Sink<BytesMut> for ShutdownSink<S, Si>
-where
-    S: Sink<Si> + Send + Unpin,
-    Si: From<BytesMut> + Send + Unpin,
-{
-    type Error = io::Error;
-
-    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.sink
-            .poll_ready_unpin(cx)
-            .map_err(|_| io::ErrorKind::NotConnected.into())
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.sink
-            .poll_flush_unpin(cx)
-            .map_err(|_| io::ErrorKind::NotConnected.into())
-    }
-
-    fn start_send(mut self: Pin<&mut Self>, item: BytesMut) -> Result<(), Self::Error> {
-        self.sink
-            .start_send_unpin(item.into())
-            .map_err(|_| io::ErrorKind::NotConnected.into())
-    }
-
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.sink
-            .poll_close_unpin(cx)
-            .map_err(|_| io::ErrorKind::NotConnected.into())
-    }
-}
-
-pub async fn kcp_sys_shutdown() {
-    SHUTDOWN_POOL.shutdown().await;
 }

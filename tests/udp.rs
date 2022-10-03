@@ -24,7 +24,7 @@ async fn test_udp_stream() {
     let mut server = KcpUdpStream::listen(config.clone(), server_addr, 8, None)
         .await
         .unwrap();
-
+ 
     let (s1, s2) = tokio::join!(
         KcpUdpStream::connect(config.clone(), server_addr),
         server.next(),
