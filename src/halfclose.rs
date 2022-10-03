@@ -38,7 +38,7 @@ impl Default for HalfClosePool {
 
 impl HalfClosePool {
     pub async fn create_task<T, Si>(
-        transport: T,
+        mut transport: T,
         reset_packet: BytesMut,
         half_close_timeout: Duration,
     ) where
@@ -49,7 +49,6 @@ impl HalfClosePool {
 
         // Create task.
         let mut task = HalfClose {
-            transport,
             reset_packet,
             repeat: (half_close_timeout.as_secs() as usize).min(1),
             token: this.token.child_token(),
@@ -61,7 +60,7 @@ impl HalfClosePool {
 
         // Send the reset packet directly.
         task.repeat -= 1;
-        if task.send().await.is_err() || task.repeat == 0 {
+        if task.send(&mut transport).await.is_err() || task.repeat == 0 {
             return;
         }
 
@@ -69,7 +68,7 @@ impl HalfClosePool {
             warn!("The KCP stream half-close pool has been shut down.");
             return;
         }
-        tokio::spawn(task.run());
+        tokio::spawn(task.run(transport));
     }
 
     pub async fn shutdown() {
@@ -82,13 +81,12 @@ impl HalfClosePool {
 }
 
 struct HalfClose<T, Si> {
-    transport: T,
     reset_packet: BytesMut,
     repeat: usize,
     token: CancellationToken,
     notify: Arc<Notify>,
     counter: Arc<AtomicUsize>,
-    _phantom: PhantomData<Si>,
+    _phantom: PhantomData<(T, Si)>,
 }
 
 impl<T, Si> Drop for HalfClose<T, Si> {
@@ -103,18 +101,18 @@ where
     T: Sink<Si> + Stream<Item = BytesMut> + Send + Unpin,
     Si: From<BytesMut> + Send + Unpin,
 {
-    async fn run(mut self) {
+    async fn run(mut self, mut transport: T) {
         let mut timer = interval(Duration::from_secs(1));
         timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         for _ in 0..self.repeat {
             select! {
                 _ = timer.tick() => {
-                    if self.send().await.is_err() {
+                    if self.send(&mut transport).await.is_err() {
                         break;
                     }
                 }
-                x = self.transport.next() => {
+                x = transport.next() => {
                     if x.is_none() {
                         break;
                     }
@@ -122,12 +120,16 @@ where
                 _ = self.token.cancelled() => break,
             }
         }
+
+        // Drop transport before self.
+        drop(transport);
+        drop(self);
     }
 
-    async fn send(&mut self) -> Result<(), ()> {
+    async fn send(&mut self, transport: &mut T) -> Result<(), ()> {
         select! {
             biased;
-            x = self.transport.send(self.reset_packet.clone().into()) => x.map_err(|_| ()),
+            x = transport.send(self.reset_packet.clone().into()) => x.map_err(|_| ()),
             _ = self.token.cancelled() => Err(()),
         }
     }
