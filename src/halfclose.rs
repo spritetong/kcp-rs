@@ -105,19 +105,22 @@ where
         let mut timer = interval(Duration::from_secs(1));
         timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-        for _ in 0..self.repeat {
+        let mut is_closed = false;
+        while self.repeat > 0 {
             select! {
+                biased;
+                _ = self.token.cancelled() => break,
                 _ = timer.tick() => {
                     if self.send(&mut transport).await.is_err() {
                         break;
                     }
+                    self.repeat -= 1;
                 }
-                x = transport.next() => {
+                x = transport.next(), if !is_closed => {
                     if x.is_none() {
-                        break;
+                        is_closed = true;
                     }
                 }
-                _ = self.token.cancelled() => break,
             }
         }
 
