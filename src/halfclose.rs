@@ -50,7 +50,7 @@ impl HalfClosePool {
         // Create task.
         let mut task = HalfClose {
             reset_packet,
-            repeat: (half_close_timeout.as_secs() as usize).min(1),
+            repeat: (half_close_timeout.as_secs() as usize).max(1),
             token: this.token.child_token(),
             notify: this.notify.clone(),
             counter: this.task_count.clone(),
