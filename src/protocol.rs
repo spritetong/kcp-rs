@@ -203,10 +203,10 @@ impl Kcp {
         unsafe {
             ikcp_nodelay(
                 self.as_mut(),
-                if nodelay { 1 } else { 0 },
+                nodelay.into(),
                 interval as c_int,
                 resend as c_int,
-                if nc { 1 } else { 0 },
+                nc.into(),
             );
         }
     }
@@ -221,7 +221,6 @@ impl Kcp {
         }
     }
 }
-
 
 impl Kcp {
     export_fields! { conv, current, nsnd_que, nrcv_que, nrcv_buf }
@@ -239,7 +238,7 @@ impl Kcp {
     }
 
     pub fn set_stream(&mut self, stream: bool) {
-        self.as_mut().stream = if stream { 1 } else { 0 };
+        self.as_mut().stream = stream.into();
     }
 
     #[inline]
