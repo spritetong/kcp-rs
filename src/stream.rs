@@ -468,7 +468,7 @@ where
                     if closed {
                         debug!("{} input channel has been closed, start FIN handshake", &self);
                         self.flags |= Self::INPUT_CLOSED;
-                        self.fin_transite_state();
+                        self.fin_transit_state();
                     }
                     // Try to flush.
                     self.kcp_flush();
@@ -516,7 +516,7 @@ where
                                 }
                             } else if self.is_fin_handshake() {
                                 // FIN handshake.
-                                self.fin_transite_state();
+                                self.fin_transit_state();
                             }
 
                             // Try to fetch a frame.
@@ -653,7 +653,7 @@ where
         }
     }
 
-    fn fin_transite_state(&mut self) {
+    fn fin_transit_state(&mut self) {
         loop {
             let state = match self.hs {
                 Handshake::Syn => Handshake::Disconnected,
@@ -793,7 +793,7 @@ where
                             // Do not get any more input.
                             self.input_rx.close();
                         }
-                        self.fin_transite_state();
+                        self.fin_transit_state();
                         Kcp::write_cmd(&mut packet, cmd ^ Self::KCP_FIN);
                         if self.kcp.input(&packet).is_ok() {
                             return;

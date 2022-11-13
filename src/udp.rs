@@ -160,6 +160,7 @@ struct Task {
     pkt_tx: UnboundedSender<(Bytes, SocketAddr)>,
     pkt_rx: UnboundedReceiver<(Bytes, SocketAddr)>,
     token: CancellationToken,
+    is_closing: bool,
 
     conv_map: LinkedHashMap<u32, Session>,
     sid_map: LinkedHashMap<Bytes, u32>,
@@ -183,6 +184,7 @@ impl Task {
             pkt_tx,
             pkt_rx,
             token,
+            is_closing: false,
             conv_map: LinkedHashMap::new(),
             sid_map: LinkedHashMap::new(),
         }
@@ -191,7 +193,16 @@ impl Task {
     async fn run(mut self, udp: UdpSocket) {
         let mut transport = UdpFramed::new(udp, BytesCodec::new());
 
-        'outer: loop {
+        loop {
+            if self.is_closing {
+                // Try to drain all connection messages.
+                match self.msg_rx.try_recv() {
+                    Ok(msg) => self.process_msg(msg).await,
+                    Err(_) if self.conv_map.is_empty() => break,
+                    _ => (),
+                }
+            }
+
             select! {
                 x = transport.next() => {
                     let mut recved = x;
@@ -203,7 +214,11 @@ impl Task {
                                 }
                             }
                             Some(Err(_)) => break,
-                            None => break 'outer,
+                            None => {
+                                self.is_closing = true;
+                                self.token.cancel();
+                                break;
+                            }
                         }
 
                         // Try to receive more.
@@ -220,42 +235,37 @@ impl Task {
                     self.try_send(&mut transport, LISTENER_TASK_LOOP).await;
                 }
 
-                Some(msg) = self.msg_rx.recv() => {
-                    match msg {
-                        Message::Connect(stream) => {
-                            if let Some(session) = self.conv_map.get_mut(&stream.conv()) {
-                                if let Some(task) = session.task.take() {
-                                    let _ = task.await;
-                                }
-                                if let Some(permit) = session.stream_permit.take() {
-                                    permit.send((stream, session.peer_addr));
-                                }
-                            }
-                        }
-                        Message::Disconnect { conv } => {
-                            if let Some(session) = self.conv_map.remove(&conv) {
-                                self.kill_session(session).await;
-                            }
-                        }
-                    }
-                }
+                Some(msg) = self.msg_rx.recv() => self.process_msg(msg).await,
 
-                _ = self.token.cancelled() => break,
+                _ = self.token.cancelled(), if !self.is_closing => {
+                    self.is_closing = true;
+                }
             }
         }
 
         self.msg_rx.close();
-        self.token.cancel();
-        self.try_send(&mut transport, usize::MAX).await;
-
-        // Close all sessions.
-        while let Some((_, session)) = self.conv_map.pop_front() {
-            self.kill_session(session).await;
-            self.try_send(&mut transport, usize::MAX).await;
-        }
-
         self.pkt_rx.close();
         self.try_send(&mut transport, usize::MAX).await;
+    }
+
+    async fn process_msg(&mut self, msg: Message) {
+        match msg {
+            Message::Connect(stream) => {
+                if let Some(session) = self.conv_map.get_mut(&stream.conv()) {
+                    if let Some(task) = session.task.take() {
+                        let _ = task.await;
+                    }
+                    if let Some(permit) = session.stream_permit.take() {
+                        permit.send((stream, session.peer_addr));
+                    }
+                }
+            }
+            Message::Disconnect { conv } => {
+                if let Some(session) = self.conv_map.remove(&conv) {
+                    self.kill_session(session).await;
+                }
+            }
+        }
     }
 
     async fn try_send<S: Sink<(Bytes, SocketAddr)> + Unpin>(&mut self, sink: &mut S, max: usize) {
@@ -296,12 +306,13 @@ impl Task {
                 }
             }
             None
+        } else if self.is_closing
+            || pkt_conv != Kcp::SYN_CONV
+            || session_id.len() != self.config.session_id_len
+        {
+            // It's not a SYN handshake packet.
+            None
         } else {
-            if pkt_conv != Kcp::SYN_CONV || session_id.len() != self.config.session_id_len {
-                // It's not a SYN handshake packet.
-                return None;
-            }
-
             // Get permit in the backlog limitation.
             let stream_permit = match self.stream_tx.clone().try_reserve_owned() {
                 Ok(x) => x,
