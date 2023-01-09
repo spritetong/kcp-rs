@@ -1,4 +1,4 @@
-use smart_build::*;
+use leach::*;
 
 fn main() -> io::Result<()> {
     let root = cargo::manifest::dir();
@@ -27,11 +27,11 @@ fn main() -> io::Result<()> {
 
     if cargo::features::enabled("gen-ffi") {
         // Generate the FFI file.
-        cmake::bindgen(
-            src_dir.join("ffi.rs"),
-            [kcp_dir.join("ikcp.h"), kcp_dir.join("ikcp.c")],
-            [&kcp_dir],
-            [
+        cmake::Bindgen::default()
+            .rs_file(src_dir.join("ffi.rs"))
+            .headers([kcp_dir.join("ikcp.h"), kcp_dir.join("ikcp.c")])
+            .includes([&kcp_dir])
+            .allowlist([
                 "IKCP_.*",
                 "ikcp_create",
                 "ikcp_release",
@@ -50,10 +50,10 @@ fn main() -> io::Result<()> {
                 "ikcp_log",
                 "ikcp_allocator",
                 "ikcp_getconv",
-            ],
-            ["__.*"],
-            |x| Some(x.derive_default(false).derive_debug(false)),
-        )?;
+            ])
+            .blocklist(["__.*"])
+            .derive(None::<&str>, ["Copy", "-Debug"])
+            .generate(None)?;
     }
 
     Ok(())

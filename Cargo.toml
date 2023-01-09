@@ -31,5 +31,5 @@ tokio-util = { version = "0.7", features = ["codec", "io", "net"], optional = tr
 env_logger = "0.10"
 
 [build-dependencies]
-smart-build = { git = "https://git.whiftec.com/git/rust/smart-build.git" }
+leach = { git = "https://git.whiftec.com/git/rust/leach.git" }
 cc = { version = "1.0" }
