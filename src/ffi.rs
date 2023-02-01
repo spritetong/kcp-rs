@@ -3,7 +3,6 @@
 #![allow(non_camel_case_types)]
 #![allow(clippy::missing_safety_doc)]
 
-
 pub const IKCP_LOG_OUTPUT: u32 = 1;
 pub const IKCP_LOG_INPUT: u32 = 2;
 pub const IKCP_LOG_SEND: u32 = 4;
@@ -208,5 +207,3 @@ pub const IKCP_THRESH_MIN: IUINT32 = 2;
 pub const IKCP_PROBE_INIT: IUINT32 = 7000;
 pub const IKCP_PROBE_LIMIT: IUINT32 = 120000;
 pub const IKCP_FASTACK_LIMIT: IUINT32 = 5;
-
-
