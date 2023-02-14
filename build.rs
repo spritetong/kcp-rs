@@ -29,6 +29,7 @@ fn main() -> io::Result<()> {
         // Generate the FFI file.
         cmake::Bindgen::default()
             .rs_file(src_dir.join("ffi.rs"))
+            .allow_bad_code_styles()
             .headers([kcp_dir.join("ikcp.h"), kcp_dir.join("ikcp.c")])
             .includes([&kcp_dir])
             .allowlist([
