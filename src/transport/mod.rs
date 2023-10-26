@@ -1,8 +1,10 @@
-mod merge;
+mod duplex;
 mod mpsc;
+mod sink;
 
-pub use merge::MergeTransport;
+pub use duplex::DuplexTransport;
 pub use mpsc::{MpscTransport, UnboundedSink};
+pub use sink::SinkRsx;
 
 #[cfg(feature = "udp")]
 mod udp;

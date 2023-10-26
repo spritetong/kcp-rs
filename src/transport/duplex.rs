@@ -5,14 +5,14 @@ use std::{
     task::{Context, Poll},
 };
 
-pub struct MergeTransport<S, Si, R> {
-    sink: S,
-    stream: R,
-    _phantom: PhantomData<Si>,
+pub struct DuplexTransport<Si, Item, St> {
+    sink: Si,
+    stream: St,
+    _phantom: PhantomData<Item>,
 }
 
-impl<S, Si, R> MergeTransport<S, Si, R> {
-    pub fn new(sink: S, stream: R) -> Self {
+impl<Si, Item, St> DuplexTransport<Si, Item, St> {
+    pub fn new(sink: Si, stream: St) -> Self {
         Self {
             sink,
             stream,
@@ -20,34 +20,34 @@ impl<S, Si, R> MergeTransport<S, Si, R> {
         }
     }
 
-    pub fn get_sink(&self) -> &S {
+    pub fn get_sink(&self) -> &Si {
         &self.sink
     }
 
-    pub fn get_sink_mut(&mut self) -> &mut S {
+    pub fn get_sink_mut(&mut self) -> &mut Si {
         &mut self.sink
     }
 
-    pub fn get_stream(&self) -> &R {
+    pub fn get_stream(&self) -> &St {
         &self.stream
     }
 
-    pub fn get_stream_mut(&mut self) -> &mut R {
+    pub fn get_stream_mut(&mut self) -> &mut St {
         &mut self.stream
     }
 
-    pub fn split_into(self) -> (S, R) {
+    pub fn split_into(self) -> (Si, St) {
         (self.sink, self.stream)
     }
 }
 
-impl<S, Si, R> Sink<Si> for MergeTransport<S, Si, R>
+impl<Si, Item, St> Sink<Item> for DuplexTransport<Si, Item, St>
 where
-    S: Sink<Si> + Unpin,
-    Si: Send + Unpin,
-    R: Stream + Unpin,
+    Si: Sink<Item> + Unpin,
+    Item: Send + Unpin,
+    St: Stream + Unpin,
 {
-    type Error = S::Error;
+    type Error = Si::Error;
 
     #[inline]
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -60,7 +60,7 @@ where
     }
 
     #[inline]
-    fn start_send(mut self: Pin<&mut Self>, item: Si) -> Result<(), Self::Error> {
+    fn start_send(mut self: Pin<&mut Self>, item: Item) -> Result<(), Self::Error> {
         self.sink.start_send_unpin(item)
     }
 
@@ -70,13 +70,13 @@ where
     }
 }
 
-impl<S, Si, R> Stream for MergeTransport<S, Si, R>
+impl<Si, Item, St> Stream for DuplexTransport<Si, Item, St>
 where
-    S: Sink<Si> + Unpin,
-    Si: Send + Unpin,
-    R: Stream + Unpin,
+    Si: Sink<Item> + Unpin,
+    Item: Send + Unpin,
+    St: Stream + Unpin,
 {
-    type Item = R::Item;
+    type Item = St::Item;
 
     #[inline]
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {

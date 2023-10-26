@@ -24,7 +24,7 @@ pub use crate::udp::KcpUdpStream;
 #[cfg(feature = "conv")]
 pub mod conv;
 
-/// Call before system exit and all KCP connections have been closed.
+/// Call after closing all KCP connections and before system exit
 pub async fn kcp_sys_shutdown() {
     #[cfg(feature = "stream")]
     halfclose::HalfClosePool::shutdown().await;

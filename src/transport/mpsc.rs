@@ -43,6 +43,11 @@ where
     pub fn get_stream_mut(&mut self) -> &mut Receiver<R> {
         &mut self.stream
     }
+
+    #[inline]
+    pub fn split_into(self) -> (PollSender<S>, Receiver<R>) {
+        (self.sink, self.stream)
+    }
 }
 
 impl<S, R> Sink<S> for MpscTransport<S, R>
