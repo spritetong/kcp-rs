@@ -11,18 +11,19 @@ path = "src/lib.rs"
 [features]
 default = ["udp"]
 conv = ["parking_lot", "hashlink"]
-stream = ["futures", "once_cell", "tokio", "tokio-stream", "tokio-util"]
+stream = ["futures", "futures-util", "once_cell", "pin-project","tokio", "tokio-stream", "tokio-util"]
 udp = ["conv", "stream"]
 #gen-ffi = []
 
 [dependencies]
 bytes = "1"
 futures = { version = "0.3", optional = true }
+futures-util = { version = "0.3", optional = true }
 hashlink = { version = "0.8", optional = true }
 log = "0.4"
 once_cell = { version = "1", optional = true }
 parking_lot = { version = "0.12", optional = true }
-pin-project = "1"
+pin-project = { version = "1", optional = true }
 rand = "0.8"
 tokio = { version = "1", features = ["net", "sync", "rt", "macros", "time"], optional = true }
 tokio-stream = { version = "0.1", features = ["sync"], optional = true }

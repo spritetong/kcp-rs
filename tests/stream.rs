@@ -3,8 +3,8 @@
 async fn test_stream() {
     use ::bytes::{Bytes, BytesMut};
     use ::futures::{SinkExt, StreamExt};
-    use ::kcp::*;
     use ::kcp::transport::*;
+    use ::kcp::*;
     use ::log::info;
     use ::std::{sync::Arc, time::Duration};
     use ::tokio::select;
@@ -37,15 +37,15 @@ async fn test_stream() {
         //     .with(move |x: Bytes| ready(io::Result::Ok((x, addr1))));
 
         (
-            UdpTransport::new(UdpSocket::bind(addr1).await.unwrap(), addr2),
-            UdpTransport::new(UdpSocket::bind(addr2).await.unwrap(), addr1),
+            UdpStream::new(UdpSocket::bind(addr1).await.unwrap(), addr2),
+            UdpStream::new(UdpSocket::bind(addr2).await.unwrap(), addr1),
         )
     };
     #[cfg(not(feature = "udp"))]
     let (s1, s2) = {
         let (tx1, rx2) = tokio::sync::mpsc::channel::<BytesMut>(1024);
         let (tx2, rx1) = tokio::sync::mpsc::channel::<BytesMut>(1024);
-        (MpscTransport::new(tx1, rx1), MpscTransport::new(tx2, rx2))
+        (tokio_mpsc_stream(tx1, rx1), tokio_mpsc_stream(tx2, rx2))
     };
 
     let config = Arc::new(KcpConfig {

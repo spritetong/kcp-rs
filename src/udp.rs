@@ -110,7 +110,7 @@ impl KcpUdpStream {
 
         KcpStream::connect::<_, BytesMut, _>(
             config,
-            UdpTransport::new(udp, addr),
+            UdpStream::new(udp, addr),
             futures::sink::drain(),
             None,
         )
@@ -365,7 +365,7 @@ impl Task {
         if let Ok(stream) = KcpStream::accept(
             config,
             conv,
-            UdpMpscTransport::new(Some(pkt_tx), receiver, peer_addr),
+            UdpMpscStream::new(Some(pkt_tx), receiver, peer_addr),
             disconnect,
             Some(token),
         )

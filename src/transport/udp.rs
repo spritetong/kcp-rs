@@ -12,12 +12,12 @@ use tokio::{
 };
 use tokio_util::{codec::BytesCodec, udp::UdpFramed};
 
-pub struct UdpTransport {
+pub struct UdpStream {
     udp: UdpFramed<BytesCodec, UdpSocket>,
     peer_addr: SocketAddr,
 }
 
-impl UdpTransport {
+impl UdpStream {
     pub fn new(udp: UdpSocket, peer_addr: SocketAddr) -> Self {
         Self {
             peer_addr,
@@ -26,7 +26,7 @@ impl UdpTransport {
     }
 }
 
-impl<T: Into<Bytes>> Sink<T> for UdpTransport {
+impl<T: Into<Bytes>> Sink<T> for UdpStream {
     type Error = io::Error;
 
     #[inline]
@@ -55,7 +55,7 @@ impl<T: Into<Bytes>> Sink<T> for UdpTransport {
 }
 
 #[cfg(feature = "udp")]
-impl Stream for UdpTransport {
+impl Stream for UdpStream {
     type Item = BytesMut;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -78,13 +78,13 @@ impl Stream for UdpTransport {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-pub struct UdpMpscTransport<T> {
+pub struct UdpMpscStream<T> {
     sink: Option<UnboundedSender<(T, SocketAddr)>>,
     stream: Receiver<BytesMut>,
     peer_addr: SocketAddr,
 }
 
-impl<T> UdpMpscTransport<T> {
+impl<T> UdpMpscStream<T> {
     pub fn new(
         sink: Option<UnboundedSender<(T, SocketAddr)>>,
         stream: Receiver<BytesMut>,
@@ -118,7 +118,7 @@ impl<T> UdpMpscTransport<T> {
     }
 }
 
-impl<T: Into<Bytes>> Sink<T> for UdpMpscTransport<T> {
+impl<T: Into<Bytes>> Sink<T> for UdpMpscStream<T> {
     type Error = io::Error;
 
     fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -155,7 +155,7 @@ impl<T: Into<Bytes>> Sink<T> for UdpMpscTransport<T> {
     }
 }
 
-impl<T> Stream for UdpMpscTransport<T> {
+impl<T> Stream for UdpMpscStream<T> {
     type Item = BytesMut;
 
     #[inline]
