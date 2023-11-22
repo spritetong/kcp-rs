@@ -119,7 +119,7 @@ impl KcpStream {
         <T as Sink<Si>>::Error: Display,
         D: Sink<u32> + Send + Unpin + 'static,
     {
-        let token = token.unwrap_or_else(CancellationToken::new);
+        let token = token.unwrap_or_default();
         let (input_tx, input_rx) = channel(config.snd_wnd.max(8) as usize);
         let (output_tx, output_rx) = channel(config.rcv_wnd.max(16) as usize);
 
