@@ -1,5 +1,13 @@
 [package]
 name = "kcp-rs"
+authors = ["Sprite Tong <spritetong@gmail.com>"]
+description = "A Rust implementation of KCP Stream Protocol"
+repository = "https://github.com/spritetong/kcp-rs"
+keywords = ["kcp", "protocol", "network", "reliability", "udp"]
+categories = ["network-programming", "asynchronous"]
+documentation = "https://docs.rs/kcp-rs"
+license = "MIT"
+readme = "README.md"
 version = "0.2.4"
 edition = "2021"
 build = "build.rs"
