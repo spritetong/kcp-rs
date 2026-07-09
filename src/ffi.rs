@@ -1,9 +1,13 @@
 ﻿#![allow(dead_code)]
 #![allow(improper_ctypes)]
+#![allow(improper_ctypes_definitions)]
 #![allow(non_camel_case_types)]
-#![allow(non_upper_case_globals)]
 #![allow(non_snake_case)]
+#![allow(non_upper_case_globals)]
 #![allow(clippy::missing_safety_doc)]
+#![allow(clippy::missing_transmute_annotations)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::useless_transmute)]
 
 pub const IKCP_LOG_OUTPUT: u32 = 1;
 pub const IKCP_LOG_INPUT: u32 = 2;
@@ -94,13 +98,13 @@ pub struct IKCPCB {
     >,
 }
 pub type ikcpcb = IKCPCB;
-extern "C" {
+unsafe extern "C" {
     pub fn ikcp_create(conv: IUINT32, user: *mut ::std::os::raw::c_void) -> *mut ikcpcb;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn ikcp_release(kcp: *mut ikcpcb);
 }
-extern "C" {
+unsafe extern "C" {
     pub fn ikcp_setoutput(
         kcp: *mut ikcpcb,
         output: ::std::option::Option<
@@ -113,53 +117,53 @@ extern "C" {
         >,
     );
 }
-extern "C" {
+unsafe extern "C" {
     pub fn ikcp_recv(
         kcp: *mut ikcpcb,
         buffer: *mut ::std::os::raw::c_char,
         len: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn ikcp_send(
         kcp: *mut ikcpcb,
         buffer: *const ::std::os::raw::c_char,
         len: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn ikcp_update(kcp: *mut ikcpcb, current: IUINT32);
 }
-extern "C" {
+unsafe extern "C" {
     pub fn ikcp_check(kcp: *const ikcpcb, current: IUINT32) -> IUINT32;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn ikcp_input(
         kcp: *mut ikcpcb,
         data: *const ::std::os::raw::c_char,
         size: ::std::os::raw::c_long,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn ikcp_flush(kcp: *mut ikcpcb);
 }
-extern "C" {
+unsafe extern "C" {
     pub fn ikcp_peeksize(kcp: *const ikcpcb) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn ikcp_setmtu(kcp: *mut ikcpcb, mtu: ::std::os::raw::c_int) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn ikcp_wndsize(
         kcp: *mut ikcpcb,
         sndwnd: ::std::os::raw::c_int,
         rcvwnd: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn ikcp_waitsnd(kcp: *const ikcpcb) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn ikcp_nodelay(
         kcp: *mut ikcpcb,
         nodelay: ::std::os::raw::c_int,
@@ -168,7 +172,7 @@ extern "C" {
         nc: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn ikcp_log(
         kcp: *mut ikcpcb,
         mask: ::std::os::raw::c_int,
@@ -176,7 +180,7 @@ extern "C" {
         ...
     );
 }
-extern "C" {
+unsafe extern "C" {
     pub fn ikcp_allocator(
         new_malloc: ::std::option::Option<
             unsafe extern "C" fn(arg1: usize) -> *mut ::std::os::raw::c_void,
@@ -184,7 +188,7 @@ extern "C" {
         new_free: ::std::option::Option<unsafe extern "C" fn(arg1: *mut ::std::os::raw::c_void)>,
     );
 }
-extern "C" {
+unsafe extern "C" {
     pub fn ikcp_getconv(ptr: *const ::std::os::raw::c_void) -> IUINT32;
 }
 pub const IKCP_RTO_NDL: IUINT32 = 30;

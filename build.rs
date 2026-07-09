@@ -27,7 +27,7 @@ fn main() -> io::Result<()> {
 
     if cargo::features::enabled("gen-ffi") {
         // Generate the FFI file.
-        cmake::Bindgen::default()
+        bgx::Bindgen::default()
             .rs_file(src_dir.join("ffi.rs"))
             .allow_bad_code_styles()
             .headers([kcp_dir.join("ikcp.h"), kcp_dir.join("ikcp.c")])
